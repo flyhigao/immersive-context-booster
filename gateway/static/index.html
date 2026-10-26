@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>沉浸式翻译 · 智能语境与术语管理中心</title>
+  <link rel="stylesheet" href="static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%22%20100%22><text y=%22.9em%22 font-size=%2290%22>🏀</text></svg>">
+</head>
+<body>
+  <div class="app-container">
+    <!-- 头部导航 -->
+    <header class="app-header">
+      <div class="header-left">
+        <span class="logo-icon">🏀</span>
+        <div>
+          <h1>沉浸式翻译 · 智能语境与术语中枢</h1>
+          <p class="subtitle">专为 Reddit 篮球论坛、Quora 问答 & YouTube 视频定制的 AI 语境增强系统</p>
+        </div>
+      </div>
+      <div class="header-right">
+        <a href="immersive-context-booster.user.js" class="btn btn-primary" id="btn-install-script" style="text-decoration: none; font-weight: 600;">
+          ⚡ 一键安装/更新油猴脚本
+        </a>
+        <div class="status-badge" id="server-status">
+          <span class="status-dot online"></span>
+          <span id="server-status-text">网关在线</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- 当前活跃语境看板 -->
+    <section class="card context-card">
+      <div class="card-header">
+        <div class="card-title">
+          <span class="icon">🎯</span>
+          <h2>当前生效网页 / 视频语境</h2>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-secondary btn-sm" id="btn-refresh-context">刷新</button>
+          <button class="btn btn-danger-outline btn-sm" id="btn-clear-context">重置为通用模式</button>
+        </div>
+      </div>
+      <div class="card-body" id="context-content">
+        <div class="loading-placeholder">正在获取当前浏览器语境...</div>
+      </div>
+    </section>
+
+    <!-- 术语管理区域 -->
+    <section class="card terms-card">
+      <div class="card-header">
+        <div class="card-title">
+          <span class="icon">📚</span>
+          <h2>专业术语与黑话词典库</h2>
+          <span class="badge" id="terms-count-badge">0 个术语</span>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-primary" id="btn-open-add-modal">+ 添加新术语</button>
+          <button class="btn btn-secondary" id="btn-export-terms">📥 导出 JSON</button>
+        </div>
+      </div>
+
+      <!-- 筛选栏 -->
+      <div class="filter-bar">
+        <div class="search-input-wrapper">
+          <span class="search-icon">🔍</span>
+          <input type="text" id="search-input" placeholder="搜索英文原词、中文译法或备注说明..." />
+        </div>
+        <div class="category-filters" id="category-filters">
+          <button class="chip active" data-cat="全部">全部</button>
+        </div>
+      </div>
+
+      <!-- 术语列表表格 -->
+      <div class="table-responsive">
+        <table class="terms-table">
+          <thead>
+            <tr>
+              <th width="20%">英文原词 / 俚语</th>
+              <th width="23%">准确中文翻译 (严禁直译)</th>
+              <th width="14%">分类</th>
+              <th width="23%">语境与原因说明</th>
+              <th width="8%">命中翻译</th>
+              <th width="12%">操作</th>
+            </tr>
+          </thead>
+          <tbody id="terms-tbody">
+            <tr><td colspan="6" class="text-center">加载中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <!-- 添加/编辑术语模态弹窗 -->
+  <div class="modal-overlay" id="term-modal" style="display: none;">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">添加新术语</h3>
+        <button class="modal-close" id="btn-close-modal">&times;</button>
+      </div>
+      <form id="term-form">
+        <input type="hidden" id="form-term-id" value="" />
+        <div class="form-group">
+          <label>英文原词 / 缩写 / 俚语黑话 *</label>
+          <input type="text" id="form-source" required placeholder="如: clutch, brick, posterize" />
+        </div>
+        <div class="form-group">
+          <label>地道中文对应译法 *</label>
+          <input type="text" id="form-target" required placeholder="如: 关键时刻/大心脏, 打铁, 隔扣" />
+        </div>
+        <div class="form-group">
+          <label>分类</label>
+          <input type="text" id="form-category" value="篮球/术语" placeholder="如: 篮球/术语, 篮球/战术, Reddit/社区" />
+        </div>
+        <div class="form-group">
+          <label>语境说明与防误翻提示</label>
+          <textarea id="form-note" rows="3" placeholder="例如: 比赛最后关键时刻的表现，严禁直译为离合器"></textarea>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-modal">取消</button>
+          <button type="submit" class="btn btn-primary" id="btn-save-term">保存并生效</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="static/app.js"></script>
+</body>
+</html>
