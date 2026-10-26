@@ -29,13 +29,10 @@ from gateway.analyzer import analyze_web_or_video, extract_terms_from_translatio
 
 app = FastAPI(title="Immersive Context & Term Booster Gateway")
 
-# 1. 显卡防爆异步信号量队列（默认控制并发为 3，多余请求平滑排队缓冲）
+# 1. 显卡防爆异步信号量队列（控制并发为 3，多余请求平滑排队缓冲）
 concurrency_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENCY)
 
-# 2. 前后文滑动窗口记忆（为当前页面保留最近 4 组已译中英句对，使后续段落代词和语气连贯一致）
-sliding_window_history = deque(maxlen=4)
-
-# 启用 CORS，允许油猴脚本从任意网页（如 reddit.com, youtube.com, quora.com）跨域调用
+# 启用 CORS，允许油猴脚本从任意网页跨域调用
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -164,46 +161,39 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     # 3. 术语库智能屈折变化模糊匹配
     matched_terms = find_matching_terms(user_content)
     
-    # 4. 组装 System 提示词增强块
+    # 4. 组装 System 提示词增强块（精简强力，杜绝 7B 模型复读与幻觉）
     injection_parts = []
     
+    # 语境提示：仅在有效且主题明确时注入，单行极简
     if active_ctx and active_ctx.get("topic"):
-        injection_parts.append(
-            f"【当前全局语境参考】：\n"
-            f"- 领域: {active_ctx.get('domain', '通用')}\n"
-            f"- 讨论主题: {active_ctx.get('topic')}\n"
-            f"- 行文风格: {active_ctx.get('style', '标准')}\n"
-            f"- 背景说明: {active_ctx.get('summary', '')}"
-        )
-        
-    # 注入前后文滑动窗口记忆（最近 3~4 句历史）
-    if sliding_window_history:
-        history_lines = []
-        for h_src, h_tgt in list(sliding_window_history)[-3:]:
-            history_lines.append(f"  * 原文: \"{h_src[:80]}\" -> 译文: \"{h_tgt[:80]}\"")
-        history_text = "\n".join(history_lines)
-        injection_parts.append(
-            f"【前文上下文衔接参考（请保持人称代词、主语与叙述语气一致）】：\n{history_text}"
-        )
+        topic_clean = active_ctx.get("topic", "").strip()
+        # 基础相关性校验：若语境是篮球论坛，但文本明显完全不相关，则不硬塞
+        is_context_relevant = True
+        domain_str = active_ctx.get("domain", "")
+        if "篮球" in domain_str or "warriors" in topic_clean.lower() or "nba" in topic_clean.lower():
+            # 只有文本包含基本体育/篮球/比赛词汇时才视作相关
+            basketball_keywords = ["nba", "ball", "shot", "game", "point", "court", "coach", "play", "team", "score", "foul", "dunk", "rebound", "assist", "quarter", "lead", "win", "lose", "warriors", "lakers", "celtics", "curry", "lebron"]
+            if not any(k in user_content.lower() for k in basketball_keywords):
+                is_context_relevant = False
+                
+        if is_context_relevant and topic_clean:
+            injection_parts.append(
+                f"【语境参考】：当前正在阅读关于《{topic_clean}》的内容，请保持对应领域的专业用词与地道风格。"
+            )
 
+    # 术语提示：仅当当前段落明确命中专有词时注入具体映射，绝不多说废话
     if matched_terms:
         term_rules = []
-        for t in matched_terms[:30]:
-            note_str = f" ({t['note']})" if t['note'] else ""
-            term_rules.append(f"  * \"{t['source']}\" 必须准确翻译为 \"{t['target']}\"{note_str}")
+        for t in matched_terms[:20]:
+            term_rules.append(f"  * \"{t['source']}\" -> \"{t['target']}\"")
         term_text = "\n".join(term_rules)
         injection_parts.append(
-            f"【专有术语强制映射对照表（严禁字面直译误翻）】：\n{term_text}"
+            f"【专业术语映射表（遇到对应词汇请准确对照翻译）】：\n{term_text}"
         )
-    else:
-        if active_ctx and "篮球" in active_ctx.get("domain", ""):
-            injection_parts.append(
-                "【重要提示】：当前内容为篮球相关讨论，遇到诸如 clutch, brick, posterize, tanking, garbage time, PnR 等黑话或战术词汇时，必须采用地道的篮球界标准中文，严禁直译。"
-            )
 
     # 5. 把注入块插入到 messages 的首位 System Prompt 中
     if injection_parts:
-        injection_content = "\n\n".join(injection_parts)
+        injection_content = "\n\n".join(injection_parts) + "\n\n请严格只输出对应中文翻译结果，严禁输出任何多余解释、前缀说明或未要求的符号。"
         system_idx = -1
         for idx, m in enumerate(messages):
             if m.get("role") == "system":
@@ -260,11 +250,13 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                 return backup_resp.json()
             raise e
 
-    # 记录译文到历史滑动窗口与缓存的收尾函数
+    # 记录译文到本地缓存
     def record_translation_result(src: str, tgt: str):
         if not src or not tgt:
             return
-        sliding_window_history.append((src.strip(), tgt.strip()))
+        # 异常输出过滤：如果输出包含异常的长串 html 闭合标签，不存入缓存
+        if "span></a><div" in tgt or "正在浏览：" in tgt:
+            return
         if settings.ENABLE_CACHE and cache_key:
             set_cached_translation(cache_key, src.strip(), tgt.strip(), settings.DEFAULT_MODEL)
 
