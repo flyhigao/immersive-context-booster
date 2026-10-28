@@ -46,6 +46,26 @@
       </div>
     </section>
 
+    <!-- 实时滚动翻译请求日志看板 -->
+    <section class="card logs-card">
+      <div class="card-header">
+        <div class="card-title">
+          <span class="icon">🔴</span>
+          <h2>实时滚动翻译日志 (Live Request & Subtitle Inspector)</h2>
+          <span class="badge" id="logs-count-badge">0 条记录</span>
+        </div>
+        <div class="card-actions" style="display: flex; align-items: center; gap: 12px;">
+          <label style="font-size: 13px; color: #94a3b8; display: flex; align-items: center; gap: 4px; cursor: pointer;">
+            <input type="checkbox" id="check-auto-scroll" checked /> 自动滚向最新
+          </label>
+          <button class="btn btn-secondary btn-sm" id="btn-clear-live-logs">清空日志</button>
+        </div>
+      </div>
+      <div class="logs-container" id="logs-container">
+        <div style="color: #94a3b8; text-align: center; padding: 24px;">等待翻译请求中（看 YouTube 或刷网页时自动实时滚动呈现）...</div>
+      </div>
+    </section>
+
     <!-- 术语管理区域 -->
     <section class="card terms-card">
       <div class="card-header">

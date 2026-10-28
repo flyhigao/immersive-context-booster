@@ -70,8 +70,13 @@ document.addEventListener("DOMContentLoaded", () => {
     window.open(getApiUrl("/api/terms/export"), "_blank");
   });
 
-  // 每 5 秒轮询一次当前活跃语境
+  // 清空日志按钮
+  document.getElementById("btn-clear-live-logs").addEventListener("click", clearLiveLogs);
+
+  // 定时刷新
+  fetchLiveLogs();
   setInterval(fetchContext, 5000);
+  setInterval(fetchLiveLogs, 1500);
 });
 
 async function fetchContext() {
@@ -116,7 +121,80 @@ async function fetchContext() {
   }
 }
 
-async function clearContext() {
+async function clearLiveLogs() {
+  try {
+    await fetch(getApiUrl("/api/logs/clear"), { method: "POST" });
+    fetchLiveLogs();
+  } catch (err) {
+    console.error("清空日志失败:", err);
+  }
+}
+
+let lastLogTimestamp = "";
+
+async function fetchLiveLogs() {
+  try {
+    const resp = await fetch(getApiUrl("/api/logs/live"));
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const logs = data.logs || [];
+    const container = document.getElementById("logs-container");
+    const countBadge = document.getElementById("logs-count-badge");
+    const autoScroll = document.getElementById("check-auto-scroll").checked;
+
+    countBadge.innerText = `${logs.length} 条记录`;
+
+    if (logs.length === 0) {
+      container.innerHTML = `<div style="color: #94a3b8; text-align: center; padding: 24px;">等待翻译请求中（看 YouTube 或刷网页时自动实时滚动呈现）...</div>`;
+      lastLogTimestamp = "";
+      return;
+    }
+
+    // 检查是否有新日志
+    const newestTs = logs[0].timestamp;
+    if (newestTs === lastLogTimestamp) return;
+    lastLogTimestamp = newestTs;
+
+    // 按时间正序渲染（旧在上面，新在最下面，符合终端滚动习惯）
+    const chronologicalLogs = [...logs].reverse();
+    let html = "";
+    for (const item of chronologicalLogs) {
+      const isCache = item.type === "CACHE_HIT";
+      const isStream = item.stream === true;
+      const typeClass = isCache ? "cache-hit" : (isStream ? "stream" : "");
+      const typeLabel = isCache ? "⚡ 本地缓存命中" : (isStream ? "🌊 流式传输 (Stream)" : "🚀 单次响应");
+      
+      html += `
+        <div class="log-entry ${typeClass}">
+          <div class="log-meta">
+            <span class="log-tag">${typeLabel}</span>
+            <span>⏱️ ${escapeHtml(item.timestamp)}</span>
+          </div>
+          <div class="log-section">
+            <span class="log-section-label">📥 沉浸式翻译请求原文:</span>
+            <div class="log-content">${escapeHtml(item.user_input || "-")}</div>
+          </div>
+          ${item.raw_output ? `
+          <div class="log-section">
+            <span class="log-section-label" style="color: #f59e0b;">⚠️ 模型原始未清洗输出:</span>
+            <div class="log-content" style="color: #fcd34d;">${escapeHtml(item.raw_output)}</div>
+          </div>` : ""}
+          <div class="log-section">
+            <span class="log-section-label" style="color: #4ade80;">📤 网关输出给沉浸式翻译 (Final):</span>
+            <div class="log-content out">${escapeHtml(item.output || "-")}</div>
+          </div>
+        </div>
+      `;
+    }
+    container.innerHTML = html;
+
+    if (autoScroll) {
+      container.scrollTop = container.scrollHeight;
+    }
+  } catch (err) {
+    console.error("获取实时日志失败:", err);
+  }
+}
   if (confirm("确定重置为通用语境模式吗？")) {
     await fetch(getApiUrl("/api/context/clear"), { method: "POST" });
     fetchContext();

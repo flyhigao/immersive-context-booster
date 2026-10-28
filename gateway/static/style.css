@@ -435,3 +435,81 @@ h1 {
   gap: 10px;
   margin-top: 24px;
 }
+
+/* 实时滚动日志面板 */
+.logs-container {
+  max-height: 380px;
+  overflow-y: auto;
+  background: #090d16;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+}
+
+.log-entry {
+  background: rgba(30, 41, 59, 0.7);
+  border: 1px solid #334155;
+  border-left: 4px solid var(--primary);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.log-entry.cache-hit {
+  border-left-color: #10b981;
+}
+
+.log-entry.stream {
+  border-left-color: #38bdf8;
+}
+
+.log-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.log-tag {
+  background: #1e293b;
+  border: 1px solid #475569;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+  color: #f8fafc;
+}
+
+.log-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.log-section-label {
+  font-size: 11px;
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+.log-content {
+  background: #0f172a;
+  padding: 6px 10px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #e2e8f0;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.log-content.out {
+  color: #4ade80;
+}

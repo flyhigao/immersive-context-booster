@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import hashlib
+from datetime import datetime
 from collections import deque
 import httpx
 from typing import Optional, List, Dict, Any
@@ -65,6 +66,24 @@ def clean_marker_protocol_response(raw_text: str) -> str:
 
 # 1. 显卡防爆异步信号量队列（控制并发为 3，多余请求平滑排队缓冲）
 concurrency_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENCY)
+
+# 2. 实时滚动日志队列（内存保留最新 200 条完整调用明细，支持前端实时查看与滚动）
+live_request_logs = deque(maxlen=200)
+
+def record_live_log(log_entry: Dict[str, Any]):
+    log_entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    live_request_logs.appendleft(log_entry)
+    # 同时异步/简单追加写入日志文件便于 tail -f
+    try:
+        log_file = os.path.join(os.path.dirname(settings.DATABASE_PATH), "gateway_live.log")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*70}\n[{log_entry['timestamp']}] {log_entry.get('type', 'REQUEST')} - Stream: {log_entry.get('stream')}\n")
+            f.write(f"PROMPT / INPUT:\n{log_entry.get('user_input', '')}\n")
+            f.write(f"OUTPUT (Cleaned):\n{log_entry.get('output', '')}\n")
+            if log_entry.get("raw_output"):
+                f.write(f"RAW MODEL OUTPUT:\n{log_entry.get('raw_output', '')}\n")
+    except Exception:
+        pass
 
 # 启用 CORS，允许油猴脚本从任意网页跨域调用
 app.add_middleware(
@@ -158,6 +177,12 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
         cached_result = get_cached_translation(cache_key)
         
         if cached_result:
+            record_live_log({
+                "type": "CACHE_HIT",
+                "stream": stream,
+                "user_input": user_content_clean,
+                "output": cached_result
+            })
             if stream:
                 async def cached_stream():
                     chunk_id = f"chatcmpl-cache-{cache_key[:8]}"
@@ -357,6 +382,13 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                     await client.aclose()
                     if user_content_clean and accumulated_response.strip():
                         final_cleaned = clean_marker_protocol_response(accumulated_response) if is_marker_mode else accumulated_response
+                        record_live_log({
+                            "type": "MODEL_STREAM",
+                            "stream": True,
+                            "user_input": user_content_clean,
+                            "raw_output": accumulated_response,
+                            "output": final_cleaned
+                        })
                         record_translation_result(user_content_clean, final_cleaned)
                         if settings.AUTO_EXTRACT_TERMS:
                             background_tasks.add_task(
@@ -376,11 +408,19 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                 await client.aclose()
                 
                 translated_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                raw_before_clean = translated_content
                 if user_content_clean and translated_content.strip():
                     if "[[p" in user_content_clean:
                         translated_content = clean_marker_protocol_response(translated_content)
                         data["choices"][0]["message"]["content"] = translated_content
 
+                    record_live_log({
+                        "type": "MODEL_NON_STREAM",
+                        "stream": False,
+                        "user_input": user_content_clean,
+                        "raw_output": raw_before_clean if raw_before_clean != translated_content else None,
+                        "output": translated_content
+                    })
                     record_translation_result(user_content_clean, translated_content)
                     if settings.AUTO_EXTRACT_TERMS:
                         background_tasks.add_task(
@@ -478,6 +518,17 @@ async def api_delete_term(term_id: int):
 async def api_export_terms():
     terms, _ = get_all_terms(limit=10000)
     return JSONResponse(terms)
+
+# ----------------- 实时滚动日志 API -----------------
+
+@router.get("/api/logs/live")
+async def api_get_live_logs():
+    return {"status": "ok", "logs": list(live_request_logs)}
+
+@router.post("/api/logs/clear")
+async def api_clear_live_logs():
+    live_request_logs.clear()
+    return {"status": "ok", "message": "实时日志已清空"}
 
 # ----------------- 油猴脚本直装入口 -----------------
 
