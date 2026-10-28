@@ -195,6 +195,8 @@ async function fetchLiveLogs() {
     console.error("获取实时日志失败:", err);
   }
 }
+
+async function clearContext() {
   if (confirm("确定重置为通用语境模式吗？")) {
     await fetch(getApiUrl("/api/context/clear"), { method: "POST" });
     fetchContext();
