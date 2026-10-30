@@ -134,17 +134,22 @@ def get_term_by_id(term_id: int) -> Optional[Dict]:
 def update_term_by_id(term_id: int, source: str, target: str, category: str, note: str) -> Optional[Dict]:
     conn = get_connection()
     c = conn.cursor()
+    source_clean = source.strip()
+    target_clean = target.strip()
     c.execute("""
     UPDATE terms
     SET source = ?, target = ?, category = ?, note = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
-    """, (source.strip(), target.strip(), category.strip(), note.strip(), term_id))
+    """, (source_clean, target_clean, category.strip(), note.strip(), term_id))
     affected = c.rowcount > 0
     conn.commit()
     row = None
     if affected:
         c.execute("SELECT * FROM terms WHERE id = ?", (term_id,))
         row = dict(c.fetchone())
+        # 清理该词相关的旧翻译缓存，确保新译法立即生效
+        c.execute("DELETE FROM translation_cache WHERE source_text LIKE ?", (f"%{source_clean}%",))
+        conn.commit()
     conn.close()
     return row
 
@@ -154,28 +159,52 @@ def add_or_update_term(source: str, target: str, category: str = "篮球/术语"
     source_clean = source.strip()
     target_clean = target.strip()
     
-    c.execute("""
-    INSERT INTO terms (source, target, category, note, source_url, updated_at)
-    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(source) DO UPDATE SET
-        target = excluded.target,
-        category = CASE WHEN excluded.category != '' THEN excluded.category ELSE terms.category END,
-        note = CASE WHEN excluded.note != '' THEN excluded.note ELSE terms.note END,
-        source_url = CASE WHEN excluded.source_url != '' THEN excluded.source_url ELSE terms.source_url END,
-        updated_at = CURRENT_TIMESTAMP
-    """, (source_clean, target_clean, category, note, source_url))
+    # 过滤无效占位符或自映射
+    if not is_valid_term(source_clean, target_clean):
+        conn.close()
+        return {}
+        
+    # 检查是否已存在同名词条（大小写不敏感匹配，防止 yaxel 与 Yaxel 产生冲突双胞胎）
+    c.execute("SELECT id FROM terms WHERE LOWER(source) = LOWER(?)", (source_clean,))
+    existing = c.fetchone()
+    if existing:
+        term_id = existing[0]
+        c.execute("""
+        UPDATE terms
+        SET source = ?, target = ?,
+            category = CASE WHEN ? != '' THEN ? ELSE category END,
+            note = CASE WHEN ? != '' THEN ? ELSE note END,
+            source_url = CASE WHEN ? != '' THEN ? ELSE source_url END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """, (source_clean, target_clean, category, category, note, note, source_url, source_url, term_id))
+    else:
+        c.execute("""
+        INSERT INTO terms (source, target, category, note, source_url, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (source_clean, target_clean, category, note, source_url))
     
     conn.commit()
-    c.execute("SELECT * FROM terms WHERE source = ?", (source_clean,))
+    c.execute("SELECT * FROM terms WHERE LOWER(source) = LOWER(?)", (source_clean,))
     row = dict(c.fetchone())
+    
+    # 自动清理受该词影响的旧翻译缓存，防止旧错误翻译因缓存继续呈现
+    c.execute("DELETE FROM translation_cache WHERE source_text LIKE ?", (f"%{source_clean}%",))
+    conn.commit()
     conn.close()
     return row
 
 def delete_term(term_id: int) -> bool:
     conn = get_connection()
     c = conn.cursor()
+    c.execute("SELECT source FROM terms WHERE id = ?", (term_id,))
+    row = c.fetchone()
+    source_to_clear = row[0] if row else ""
+    
     c.execute("DELETE FROM terms WHERE id = ?", (term_id,))
     affected = c.rowcount > 0
+    if affected and source_to_clear:
+        c.execute("DELETE FROM translation_cache WHERE source_text LIKE ?", (f"%{source_to_clear}%",))
     conn.commit()
     conn.close()
     return affected
@@ -203,7 +232,12 @@ def is_valid_term(source: str, target: str) -> bool:
     # 目标中文过长（说明提取成了整句话甚至段落）
     if len(tgt) > 30:
         return False
+    # 忽略原词与目标词完全相同且无中文的无意义条目（如 yaxel -> yaxel）
+    if src.lower() == tgt.lower():
+        return False
     return True
+
+def build_fuzzy_term_regex(term_source: str) -> re.Pattern:
     """
     为英文术语生成智能词形还原正则，支持:
     - 词尾时态: brick -> brick, bricked, bricking, bricks
@@ -249,13 +283,18 @@ def find_matching_terms(text: str, limit: int = 50) -> List[Dict]:
     
     matched = []
     matched_ids = []
+    seen_sources = set()
     
     # 按照原词长度从长到短排序，优先匹配复合专有名词
     all_terms.sort(key=lambda x: len(x["source"]), reverse=True)
     
     for t in all_terms:
-        # 跳过非法占位符
+        # 跳过非法占位符或无效自映射
         if not is_valid_term(t["source"], t["target"]):
+            continue
+            
+        src_lower = t["source"].strip().lower()
+        if src_lower in seen_sources:
             continue
             
         # 处理带有斜杠的复合词条（如 "cook / cooked"）
@@ -275,6 +314,7 @@ def find_matching_terms(text: str, limit: int = 50) -> List[Dict]:
         if is_hit:
             matched.append(t)
             matched_ids.append(t["id"])
+            seen_sources.add(src_lower)
             if len(matched) >= limit:
                 break
                 
