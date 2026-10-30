@@ -47,4 +47,7 @@ class Settings(BaseModel):
     # 4. 自动提取术语开关（默认关闭自动异步提取，由用户通过前端/划词精确添加，彻底避免 AI 幻觉污染）
     AUTO_EXTRACT_TERMS: bool = os.getenv("AUTO_EXTRACT_TERMS", "false").lower() in ("true", "1", "yes")
 
+    # 5. 英文人名/专有昵称保留规则（默认开启：所有英文人名、球员姓名严格保留英文原词，禁止音译成中文或扩写全名）
+    KEEP_NAMES_UNTRANSLATED: bool = os.getenv("KEEP_NAMES_UNTRANSLATED", "true").lower() in ("true", "1", "yes")
+
 settings = Settings()

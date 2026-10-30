@@ -25,7 +25,8 @@ from gateway.db import (
     get_active_context,
     save_context,
     get_cached_translation,
-    set_cached_translation
+    set_cached_translation,
+    is_keep_original_term
 )
 from gateway.analyzer import analyze_web_or_video, extract_terms_from_translation
 
@@ -223,6 +224,12 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     # 4. 组装 System 提示词增强块（精简强力，杜绝 7B 模型复读与幻觉）
     injection_parts = []
     
+    # 英文人名与球员姓名保持原文处理规则
+    if settings.KEEP_NAMES_UNTRANSLATED:
+        injection_parts.append(
+            "【英文人名处理规则】：所有英文人名、球员姓名、用户ID昵称（如 Yaxel, Curry, Klay, Luka, Butler, LeBron 等）在译文中必须严格保留英文原文，严禁音译为中文，更严禁擅自扩写为全名。"
+        )
+
     # 语境提示：仅在有效且主题明确时注入，单行极简
     if active_ctx and active_ctx.get("topic"):
         topic_clean = active_ctx.get("topic", "").strip()
@@ -240,15 +247,31 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                 f"【语境参考】：当前正在阅读关于《{topic_clean}》的内容，请保持对应领域的专业用词与地道风格。"
             )
 
-    # 术语提示：仅当当前段落明确命中专有词时注入具体映射，绝不多说废话
+    # 术语提示：区分【保持英文不翻译】与【专业术语翻译对照】
     if matched_terms:
-        term_rules = []
-        for t in matched_terms[:20]:
-            term_rules.append(f"  * \"{t['source']}\" -> \"{t['target']}\"")
-        term_text = "\n".join(term_rules)
-        injection_parts.append(
-            f"【专业术语映射表（遇到对应词汇请准确对照翻译）】：\n{term_text}"
-        )
+        keep_original_rules = []
+        translate_rules = []
+
+        for t in matched_terms[:25]:
+            src = t["source"].strip()
+            tgt = t["target"].strip()
+            if is_keep_original_term(src, tgt):
+                keep_original_rules.append(f'  * "{src}"（必须在译文中严格保留英文原词 "{src}"，绝对禁止音译为中文或替换为全名）')
+            else:
+                note_str = f" ({t['note']})" if t.get("note") else ""
+                translate_rules.append(f'  * "{src}" -> "{tgt}"{note_str}')
+
+        if keep_original_rules:
+            injection_parts.append(
+                "【严禁翻译/强制保持英文原词清单（在译文中必须严格保留英文原文，绝对禁止音译、直译或替换为任何中文全名）】：\n"
+                + "\n".join(keep_original_rules)
+            )
+
+        if translate_rules:
+            injection_parts.append(
+                "【专业术语映射表（遇到对应词汇请准确对照翻译）】：\n"
+                + "\n".join(translate_rules)
+            )
 
     # 5. 把注入块插入到 messages 的首位 System Prompt 中
     if injection_parts:

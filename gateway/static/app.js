@@ -35,6 +35,13 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-close-modal").addEventListener("click", () => modal.style.display = "none");
   document.getElementById("btn-cancel-modal").addEventListener("click", () => modal.style.display = "none");
 
+  // 快捷设为保持英文不翻译按钮
+  document.getElementById("btn-set-keep-original").addEventListener("click", () => {
+    const src = document.getElementById("form-source").value.trim();
+    document.getElementById("form-target").value = src || "[保持原文]";
+    document.getElementById("form-note").value = document.getElementById("form-note").value || "保持英文原词，严禁音译或直译";
+  });
+
   // 表单提交（新增或编辑保存）
   document.getElementById("term-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -255,10 +262,15 @@ async function fetchTerms() {
 
     let rowsHtml = "";
     for (const t of terms) {
+      const isKeep = t.target.trim().toLowerCase() === t.source.trim().toLowerCase() || t.target === "[保持原文]" || t.target === "[不翻译]";
+      const targetDisplay = isKeep 
+        ? `<span class="badge-keep">🔤 保持英文原文 (${escapeHtml(t.source)})</span>`
+        : `<span class="term-target">${escapeHtml(t.target)}</span>`;
+
       rowsHtml += `
         <tr>
           <td><span class="term-source">${escapeHtml(t.source)}</span></td>
-          <td><span class="term-target">${escapeHtml(t.target)}</span></td>
+          <td>${targetDisplay}</td>
           <td><span class="term-cat-badge">${escapeHtml(t.category)}</span></td>
           <td><span class="term-note">${escapeHtml(t.note || "-")}</span></td>
           <td><span style="font-weight: 600; color: #f59e0b;">${t.hit_count} 次</span></td>

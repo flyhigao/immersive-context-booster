@@ -232,10 +232,19 @@ def is_valid_term(source: str, target: str) -> bool:
     # 目标中文过长（说明提取成了整句话甚至段落）
     if len(tgt) > 30:
         return False
-    # 忽略原词与目标词完全相同且无中文的无意义条目（如 yaxel -> yaxel）
-    if src.lower() == tgt.lower():
-        return False
     return True
+
+def is_keep_original_term(source: str, target: str) -> bool:
+    """
+    判断该术语是否属于【保持英文原文不翻译】规则：
+    1. 目标词与原词相同（如 Yaxel -> Yaxel, Yax -> Yax）
+    2. 目标词标记为 [保持原文] / [不翻译] / KEEP / 保持英文
+    """
+    src = source.strip().lower()
+    tgt = target.strip().lower()
+    if src == tgt or tgt in ("[保持原文]", "[不翻译]", "keep", "保持英文", "不翻译", "-") or tgt.startswith("[保持"):
+        return True
+    return False
 
 def build_fuzzy_term_regex(term_source: str) -> re.Pattern:
     """

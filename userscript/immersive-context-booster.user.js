@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         沉浸式翻译 · 智能语境与术语伴侣 (Reddit, Quora & YouTube)
 // @namespace    https://github.com/immersive-context-booster
-// @version      1.1.1
+// @version      1.1.2
 // @description  为沉浸式翻译自动注入当前 Reddit 帖子/Quora 问答/YouTube 视频的全局语境、专业领域与黑话术语，彻底解决多领域乱翻误翻问题！
 // @author       gao
 // @updateURL    http://127.0.0.1:8787/immersive-context-booster.user.js
@@ -249,8 +249,11 @@
         <input type="text" id="imt-input-src" />
       </div>
       <div>
-        <label>准确中文地道译法 *</label>
-        <input type="text" id="imt-input-tgt" placeholder="输入期望的地道译法..." />
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+          <label>准确中文地道译法 *</label>
+          <span style="font-size:11px; color:#38bdf8; cursor:pointer;" id="imt-btn-keep-src">⚡ 保持英文不翻译</span>
+        </div>
+        <input type="text" id="imt-input-tgt" placeholder="输入期望的地道译法，或点击上方保持英文..." />
       </div>
       <div>
         <label>分类 / 语境说明</label>
@@ -317,6 +320,11 @@
     quickAddBtn.style.display = "none";
     inputTgt.focus();
   }
+
+  document.getElementById("imt-btn-keep-src").addEventListener("click", () => {
+    inputTgt.value = inputSrc.value.trim() || "[保持原文]";
+    inputNote.value = inputNote.value || "保持英文原词不翻译";
+  });
 
   quickAddBtn.addEventListener("click", () => {
     openQuickDialog(selectedText);
