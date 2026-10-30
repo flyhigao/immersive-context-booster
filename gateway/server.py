@@ -39,8 +39,8 @@ def clean_marker_protocol_response(input_text: str, raw_text: str) -> str:
     2. 剥离模型开头输出的所有废话前缀，定位到第一个 [[p0]]
     3. 彻底斩断超出请求范围的脑补未知 id（如模型擅自追加的 [[p4]], [[p5]] 等），防止沉浸式翻译报 unknown_id 导致字幕堆叠回退
     4. 规范化每一行标记：确保 [[p0]] 独占一行且无空格，完美匹配沉浸式翻译严格正则 /^\[\[(p\d+)\]\]$/
-    5. 确保请求中的所有 id 都存在且非空（若模型漏掉则补全，避免 missing 校验失败）
-    6. 补齐沉浸式翻译批量标记协议必须的 [[terms]]\\n[[end]]
+    5. 确保请求中的所有 id 都存在且非空（若模型漏掉则补全为 '...'，避免 missing 校验失败）
+    6. 严格规范末尾闭合标记 [[terms]]\\n[[end]]
     """
     expected_ids = re.findall(r'\[\[(p\d+)\]\]', input_text)
     if not expected_ids:
@@ -56,8 +56,7 @@ def clean_marker_protocol_response(input_text: str, raw_text: str) -> str:
     text = re.sub(r'\[\[source_end\]\]', '', text)
     
     blocks = re.split(r'(\[\[p\d+\]\])', text)
-    cleaned_blocks = []
-    found_ids = set()
+    id_map = {}
     current_id = None
     
     for part in blocks:
@@ -66,34 +65,33 @@ def clean_marker_protocol_response(input_text: str, raw_text: str) -> str:
         id_match = re.fullmatch(r'\[\[(p\d+)\]\]', part.strip())
         if id_match:
             pid = id_match.group(1)
-            if pid in expected_set and pid not in found_ids:
+            if pid in expected_set:
                 current_id = pid
-                found_ids.add(pid)
-                cleaned_blocks.append(f"[[{pid}]]")
+                if current_id not in id_map:
+                    id_map[current_id] = []
             else:
-                # 遇到超出本次请求范围的脑补 id (如输入只有 p0..p3 却输出了 p4...)，立即截断停止后续输出！
-                current_id = None
+                # 遇到超出本次请求范围的脑补 id (如输入只有 p0..p3 却输出了 p4...)，立即截断停止后续收集！
                 break
         else:
-            if current_id:
+            if current_id and current_id in id_map:
                 cleaned_text = part.strip()
                 cleaned_text = re.sub(r'\[\[terms\]\].*', '', cleaned_text, flags=re.DOTALL).strip()
                 cleaned_text = re.sub(r'\[\[end\]\].*', '', cleaned_text, flags=re.DOTALL).strip()
                 if cleaned_text:
-                    cleaned_blocks.append(cleaned_text)
-                else:
-                    cleaned_blocks.append("...")
-                current_id = None
+                    id_map[current_id].append(cleaned_text)
 
-    # 补充模型漏掉的必须 id，避免沉浸式翻译报 missing 错误
+    cleaned_blocks = []
     for eid in expected_ids:
-        if eid not in found_ids:
-            cleaned_blocks.append(f"[[{eid}]]")
+        cleaned_blocks.append(f"[[{eid}]]")
+        texts = id_map.get(eid, [])
+        if texts:
+            cleaned_blocks.append("\n".join(texts))
+        else:
             cleaned_blocks.append("...")
 
-    result = "\n".join(cleaned_blocks).strip()
-    result += "\n[[terms]]\n[[end]]"
-    return result
+    cleaned_blocks.append("[[terms]]")
+    cleaned_blocks.append("[[end]]")
+    return "\n".join(cleaned_blocks)
 
 # 1. 显卡防爆异步信号量队列（控制并发为 3，多余请求平滑排队缓冲）
 concurrency_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENCY)
@@ -419,14 +417,23 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
 
                             # 模型流结束，执行严格协议清洗与超出 ID 截断
                             final_cleaned = clean_marker_protocol_response(user_content_clean, accumulated_response)
+                            now_ts = int(datetime.now().timestamp())
                             clean_chunk = {
-                                "id": f"chatcmpl-sub-{int(datetime.now().timestamp())}",
+                                "id": f"chatcmpl-sub-{now_ts}",
                                 "object": "chat.completion.chunk",
-                                "created": int(datetime.now().timestamp()),
+                                "created": now_ts,
                                 "model": settings.DEFAULT_MODEL,
-                                "choices": [{"index": 0, "delta": {"content": final_cleaned}, "finish_reason": "stop"}]
+                                "choices": [{"index": 0, "delta": {"content": final_cleaned}, "finish_reason": None}]
+                            }
+                            stop_chunk = {
+                                "id": f"chatcmpl-sub-{now_ts}",
+                                "object": "chat.completion.chunk",
+                                "created": now_ts,
+                                "model": settings.DEFAULT_MODEL,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                             }
                             yield f"data: {json.dumps(clean_chunk)}\r\n\r\n"
+                            yield f"data: {json.dumps(stop_chunk)}\r\n\r\n"
                             yield "data: [DONE]\r\n\r\n"
                 finally:
                     await client.aclose()
