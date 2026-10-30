@@ -32,38 +32,68 @@ from gateway.analyzer import analyze_web_or_video, extract_terms_from_translatio
 
 app = FastAPI(title="Immersive Context & Term Booster Gateway")
 
-def clean_marker_protocol_response(raw_text: str) -> str:
+def clean_marker_protocol_response(input_text: str, raw_text: str) -> str:
     """
-    清洗大模型输出，严格保证符合沉浸式翻译批量标记协议 (Marker Protocol):
-    1. 剥离大模型开头擅自输出的前缀（如 "to Simplified Chinese Language:", "以下是翻译：" 等）
-    2. 将第一处 [[p\d+]] 作为绝对起点，防止沉浸式翻译解析器因为前置杂质报 extra_content 错误
-    3. 剔除末尾大模型复读的 [[source_end]]
-    4. 规范化每一行标记：确保 [[p0]] 独占一行且无空格，完美满足沉浸式翻译的正则是严格整行匹配 /^\[\[(p\d+)\]\]$/
-    5. 补齐规范的 [[terms]]\\n[[end]]，保证沉浸式翻译将各句字幕精准切分到对应的时间轴，避免整批字幕堆在同一画面
+    根据请求原文中实际声明的 [[p\\d+]]，严格清洗对齐大模型输出:
+    1. 提取请求中所有合法的 id 列表（如 ['p0', 'p1', 'p2', 'p3']）
+    2. 剥离模型开头输出的所有废话前缀，定位到第一个 [[p0]]
+    3. 彻底斩断超出请求范围的脑补未知 id（如模型擅自追加的 [[p4]], [[p5]] 等），防止沉浸式翻译报 unknown_id 导致字幕堆叠回退
+    4. 规范化每一行标记：确保 [[p0]] 独占一行且无空格，完美匹配沉浸式翻译严格正则 /^\[\[(p\d+)\]\]$/
+    5. 确保请求中的所有 id 都存在且非空（若模型漏掉则补全，避免 missing 校验失败）
+    6. 补齐沉浸式翻译批量标记协议必须的 [[terms]]\\n[[end]]
     """
-    if "[[p" not in raw_text:
+    expected_ids = re.findall(r'\[\[(p\d+)\]\]', input_text)
+    if not expected_ids:
         return raw_text
-        
-    text = raw_text.replace("\r\n", "\n")
-    # 找到第一个 [[p\d+]] 的位置，剥离之前的所有杂质前缀
-    match = re.search(r'\[\[p\d+\]\]', text)
-    if match:
-        text = text[match.start():]
-        
-    # 移除末尾大模型可能复读的 [[source_end]]
-    text = re.sub(r'\[\[source_end\]\]', '', text).strip()
+
+    expected_set = set(expected_ids)
+    raw = raw_text.replace("\r\n", "\n")
     
-    # 规范化每一行标记：确保 [[p0]] 独占一行且无后置空格
-    text = re.sub(r'\[\[(p\d+)\]\][ \t]*\n?', r'[[\1]]\n', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    first_p = re.search(r'\[\[p\d+\]\]', raw)
+    if not first_p:
+        return raw_text
+    text = raw[first_p.start():]
+    text = re.sub(r'\[\[source_end\]\]', '', text)
     
-    # 补齐沉浸式翻译期望的闭合标记
-    if "[[end]]" not in text:
-        if "[[terms]]" not in text:
-            text += "\n[[terms]]"
-        text += "\n[[end]]"
-        
-    return text
+    blocks = re.split(r'(\[\[p\d+\]\])', text)
+    cleaned_blocks = []
+    found_ids = set()
+    current_id = None
+    
+    for part in blocks:
+        if not part:
+            continue
+        id_match = re.fullmatch(r'\[\[(p\d+)\]\]', part.strip())
+        if id_match:
+            pid = id_match.group(1)
+            if pid in expected_set and pid not in found_ids:
+                current_id = pid
+                found_ids.add(pid)
+                cleaned_blocks.append(f"[[{pid}]]")
+            else:
+                # 遇到超出本次请求范围的脑补 id (如输入只有 p0..p3 却输出了 p4...)，立即截断停止后续输出！
+                current_id = None
+                break
+        else:
+            if current_id:
+                cleaned_text = part.strip()
+                cleaned_text = re.sub(r'\[\[terms\]\].*', '', cleaned_text, flags=re.DOTALL).strip()
+                cleaned_text = re.sub(r'\[\[end\]\].*', '', cleaned_text, flags=re.DOTALL).strip()
+                if cleaned_text:
+                    cleaned_blocks.append(cleaned_text)
+                else:
+                    cleaned_blocks.append("...")
+                current_id = None
+
+    # 补充模型漏掉的必须 id，避免沉浸式翻译报 missing 错误
+    for eid in expected_ids:
+        if eid not in found_ids:
+            cleaned_blocks.append(f"[[{eid}]]")
+            cleaned_blocks.append("...")
+
+    result = "\n".join(cleaned_blocks).strip()
+    result += "\n[[terms]]\n[[end]]"
+    return result
 
 # 1. 显卡防爆异步信号量队列（控制并发为 3，多余请求平滑排队缓冲）
 concurrency_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENCY)
@@ -349,8 +379,6 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
         async def stream_generator():
             accumulated_response = ""
             is_marker_mode = "[[p" in user_content_clean
-            header_discarded = not is_marker_mode
-            buffer_header = ""
 
             async with concurrency_semaphore:
                 try:
@@ -360,64 +388,63 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                         headers=headers,
                         json=upstream_payload
                     ) as upstream_resp:
-                        async for line in upstream_resp.aiter_lines():
-                            if not line:
-                                continue
-                            if line.startswith("data: ") and not line.startswith("data: [DONE]"):
-                                try:
-                                    chunk = json.loads(line[6:])
-                                    delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                                    if delta:
-                                        accumulated_response += delta
-                                        
-                                        # 如果是字幕/段落批处理模式且尚未丢弃模型前缀
-                                        if is_marker_mode and not header_discarded:
-                                            buffer_header += delta
-                                            p_match = re.search(r'\[\[p\d+\]\]', buffer_header)
-                                            if p_match:
-                                                header_discarded = True
-                                                # 仅发送从 [[p 开始的部分
-                                                clean_delta = buffer_header[p_match.start():]
-                                                chunk["choices"][0]["delta"]["content"] = clean_delta
-                                                yield f"data: {json.dumps(chunk)}\r\n\r\n"
-                                            else:
-                                                # 前缀尚未匹配到 [[p，先不发送，等待匹配
-                                                continue
-                                        else:
-                                            yield f"{line}\r\n\r\n"
-                                except:
-                                    yield f"{line}\r\n\r\n"
-                            else:
-                                # 处理流结束前的闭合标记补齐
-                                if is_marker_mode and line.startswith("data: [DONE]"):
-                                    if "[[end]]" not in accumulated_response:
-                                        tail_text = "\n[[terms]]\n[[end]]"
-                                        tail_chunk = {
-                                            "id": "chatcmpl-tail",
-                                            "object": "chat.completion.chunk",
-                                            "created": 1700000000,
-                                            "model": settings.DEFAULT_MODEL,
-                                            "choices": [{"index": 0, "delta": {"content": tail_text}, "finish_reason": None}]
-                                        }
-                                        yield f"data: {json.dumps(tail_chunk)}\r\n\r\n"
+                        if not is_marker_mode:
+                            # 普通网页翻译：实时边译边流式输出
+                            async for line in upstream_resp.aiter_lines():
+                                if not line:
+                                    continue
                                 yield f"{line}\r\n\r\n"
+                                if line.startswith("data: ") and not line.startswith("data: [DONE]"):
+                                    try:
+                                        chunk = json.loads(line[6:])
+                                        delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                        if delta:
+                                            accumulated_response += delta
+                                    except:
+                                        pass
+                        else:
+                            # YouTube 字幕与段落批量模式：
+                            # 先完整接收模型输出，严格斩断脑补的未知 id (如 p4..)，再输出合规流，彻底解决多行字幕堆叠！
+                            async for line in upstream_resp.aiter_lines():
+                                if not line:
+                                    continue
+                                if line.startswith("data: ") and not line.startswith("data: [DONE]"):
+                                    try:
+                                        chunk = json.loads(line[6:])
+                                        delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                        if delta:
+                                            accumulated_response += delta
+                                    except:
+                                        pass
+
+                            # 模型流结束，执行严格协议清洗与超出 ID 截断
+                            final_cleaned = clean_marker_protocol_response(user_content_clean, accumulated_response)
+                            clean_chunk = {
+                                "id": f"chatcmpl-sub-{int(datetime.now().timestamp())}",
+                                "object": "chat.completion.chunk",
+                                "created": int(datetime.now().timestamp()),
+                                "model": settings.DEFAULT_MODEL,
+                                "choices": [{"index": 0, "delta": {"content": final_cleaned}, "finish_reason": "stop"}]
+                            }
+                            yield f"data: {json.dumps(clean_chunk)}\r\n\r\n"
+                            yield "data: [DONE]\r\n\r\n"
                 finally:
                     await client.aclose()
                     if user_content_clean and accumulated_response.strip():
-                        final_cleaned = clean_marker_protocol_response(accumulated_response) if is_marker_mode else accumulated_response
+                        final_res = clean_marker_protocol_response(user_content_clean, accumulated_response) if is_marker_mode else accumulated_response
                         record_live_log({
                             "type": "MODEL_STREAM",
                             "stream": True,
                             "user_input": user_content_clean,
-                            "raw_output": accumulated_response,
-                            "output": final_cleaned
+                            "raw_output": accumulated_response if accumulated_response != final_res else None,
+                            "output": final_res
                         })
-                        record_translation_result(user_content_clean, final_cleaned)
+                        record_translation_result(user_content_clean, final_res)
                         if settings.AUTO_EXTRACT_TERMS:
                             background_tasks.add_task(
                                 extract_terms_from_translation,
                                 user_content_clean,
-                                final_cleaned,
+                                final_res,
                                 active_ctx.get("domain", "") if active_ctx else ""
                             )
 
@@ -434,7 +461,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                 raw_before_clean = translated_content
                 if user_content_clean and translated_content.strip():
                     if "[[p" in user_content_clean:
-                        translated_content = clean_marker_protocol_response(translated_content)
+                        translated_content = clean_marker_protocol_response(user_content_clean, translated_content)
                         data["choices"][0]["message"]["content"] = translated_content
 
                     record_live_log({
