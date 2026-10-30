@@ -93,35 +93,8 @@ def clean_marker_protocol_response(input_text: str, raw_text: str) -> str:
     cleaned_blocks.append("[[end]]")
     return "\n".join(cleaned_blocks)
 
-COMMON_STOP_WORDS = {
-    "The", "This", "That", "These", "Those", "There", "Here", "What", "When", "Where",
-    "Why", "How", "Who", "If", "And", "But", "Or", "So", "Then", "It", "Its", "They",
-    "Their", "We", "Our", "You", "Your", "He", "His", "She", "Her", "In", "On", "At",
-    "By", "For", "With", "About", "Against", "Today", "Yesterday", "Translate",
-    "Simplified", "Chinese", "Language", "Post", "Game", "Thread", "NBA", "NFL", "MLB",
-    "IMO", "GOAT", "English", "American"
-}
-
-def extract_untranslated_entities(text: str, exclude_set = None) -> List[str]:
-    """提取英文人名、球员名称（支持 CamelCase 如 LeBron, Al Horford, Steph 等，排除沉浸式指令前缀与全大写词句）"""
-    if exclude_set is None:
-        exclude_set = set()
-    clean_text = re.sub(r'^(?:Translate to [A-Za-z\s]+:\s*)', '', text, flags=re.IGNORECASE).strip()
-    pattern = r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)*(?:\s+[A-Z][a-z]+(?:[A-Z][a-z]+)*)*\b'
-    matches = re.findall(pattern, clean_text)
-    names = []
-    for m in matches:
-        words = m.split()
-        if any(w in COMMON_STOP_WORDS for w in words):
-            continue
-        if m.lower() in exclude_set:
-            continue
-        if m not in names:
-            names.append(m)
-    return names
-
 def mask_untranslated(text: str, entities: List[str]) -> Tuple[str, Dict[str, str]]:
-    """用专有占位符替换人名，彻底阻断大模型将其音译为中文或替换为全名"""
+    """用专有占位符替换显式指定的必须保持原文字词，彻底阻断大模型将其音译为中文或替换为全名"""
     sorted_entities = sorted(entities, key=len, reverse=True)
     mapping = {}
     masked_text = text
@@ -132,7 +105,7 @@ def mask_untranslated(text: str, entities: List[str]) -> Tuple[str, Dict[str, st
     return masked_text, mapping
 
 def unmask_untranslated(text: str, mapping: Dict[str, str]) -> str:
-    """后置还原占位符为原始英文人名"""
+    """后置还原占位符为原始英文原词"""
     unmasked = text
     for token, ent in mapping.items():
         unmasked = unmasked.replace(token, ent)
@@ -299,15 +272,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     translate_terms = [t for t in matched_terms if not is_keep_original_term(t["source"], t["target"])]
     user_translate_sources = {t["source"].lower() for t in translate_terms}
 
-    # 4. 提取需进行无损占位符保护的实体列表（用户指定的保持原词 + 自动检测的英文人名）
-    entities_to_protect = [t["source"] for t in keep_original_terms]
-    if settings.KEEP_NAMES_UNTRANSLATED:
-        detected_names = extract_untranslated_entities(user_content_clean, exclude_set=user_translate_sources)
-        for d in detected_names:
-            if d not in entities_to_protect:
-                entities_to_protect.append(d)
+    # 4. 提取需进行无损占位符保护的实体列表（针对显式指定的保持原词术语，如 Yaxel, Yax 等）
+    entities_to_protect = [t["source"].strip() for t in keep_original_terms]
 
-    # 对输入消息执行前置占位保护（彻底阻断模型擅自将英文人名音译为中文或替换为全名）
+    # 对输入消息执行前置占位保护（彻底阻断模型将特定词音译或替换为全名）
     entity_mapping = {}
     if entities_to_protect:
         for m in messages:
@@ -321,12 +289,17 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     # 5. 组装 System 提示词增强块（精简强力，杜绝 7B 模型复读与幻觉）
     injection_parts = []
     
-    if entity_mapping:
+    # 英文人名与球员姓名强制保留英文原文铁律
+    if settings.KEEP_NAMES_UNTRANSLATED:
         injection_parts.append(
-            "【专有代号保护规则】：文本中出现的形如 __P_0__, __P_1__ 为受保护的英文人名或专有代号，在中文译文中必须原样保留该代号，绝对禁止翻译或修改该代号。"
+            "【重要翻译规则 - 英文人名强制保留英文原文】：\n"
+            "在翻译中，所有出现的西方人名、球星名字、球员简称（例如 Al Horford, Steph, Curry, Klay, LeBron, Luka, Yaxel 等），在中文译文中必须统一 100% 原样保留英文，严禁音译为中文汉字（例如：Al Horford 绝不能翻译为“霍福德”或“阿尔·霍福德”，必须直接写作 Al Horford；Steph 绝不能翻译为“斯蒂芬”，必须直接写作 Steph；Yaxel 必须直接写作 Yaxel；Curry 必须直接写作 Curry）。严禁将任何人名翻译为中文。"
         )
 
-    # 语境提示：仅在有效且主题明确时注入，单行极简
+    if entity_mapping:
+        injection_parts.append(
+            "【专有代号保护规则】：文本中出现的形如 __P_0__, __P_1__ 为受保护的专有代号，在中文译文中必须原样保留该代号不变。"
+        )
     if active_ctx and active_ctx.get("topic"):
         topic_clean = active_ctx.get("topic", "").strip()
         is_context_relevant = True
