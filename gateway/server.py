@@ -6,7 +6,7 @@ import hashlib
 from datetime import datetime
 from collections import deque
 import httpx
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, APIRouter, Request, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -92,6 +92,52 @@ def clean_marker_protocol_response(input_text: str, raw_text: str) -> str:
     cleaned_blocks.append("[[terms]]")
     cleaned_blocks.append("[[end]]")
     return "\n".join(cleaned_blocks)
+
+COMMON_STOP_WORDS = {
+    "The", "This", "That", "These", "Those", "There", "Here", "What", "When", "Where",
+    "Why", "How", "Who", "If", "And", "But", "Or", "So", "Then", "It", "Its", "They",
+    "Their", "We", "Our", "You", "Your", "He", "His", "She", "Her", "In", "On", "At",
+    "By", "For", "With", "About", "Against", "Today", "Yesterday", "Translate",
+    "Simplified", "Chinese", "Language", "Post", "Game", "Thread", "NBA", "NFL", "MLB",
+    "IMO", "GOAT", "English", "American"
+}
+
+def extract_untranslated_entities(text: str, exclude_set = None) -> List[str]:
+    """提取英文人名、球员名称（支持 CamelCase 如 LeBron, Al Horford, Steph 等，排除沉浸式指令前缀与全大写词句）"""
+    if exclude_set is None:
+        exclude_set = set()
+    clean_text = re.sub(r'^(?:Translate to [A-Za-z\s]+:\s*)', '', text, flags=re.IGNORECASE).strip()
+    pattern = r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)*(?:\s+[A-Z][a-z]+(?:[A-Z][a-z]+)*)*\b'
+    matches = re.findall(pattern, clean_text)
+    names = []
+    for m in matches:
+        words = m.split()
+        if any(w in COMMON_STOP_WORDS for w in words):
+            continue
+        if m.lower() in exclude_set:
+            continue
+        if m not in names:
+            names.append(m)
+    return names
+
+def mask_untranslated(text: str, entities: List[str]) -> Tuple[str, Dict[str, str]]:
+    """用专有占位符替换人名，彻底阻断大模型将其音译为中文或替换为全名"""
+    sorted_entities = sorted(entities, key=len, reverse=True)
+    mapping = {}
+    masked_text = text
+    for i, ent in enumerate(sorted_entities):
+        token = f"__P_{i}__"
+        mapping[token] = ent
+        masked_text = re.sub(r'\b' + re.escape(ent) + r'\b', token, masked_text)
+    return masked_text, mapping
+
+def unmask_untranslated(text: str, mapping: Dict[str, str]) -> str:
+    """后置还原占位符为原始英文人名"""
+    unmasked = text
+    for token, ent in mapping.items():
+        unmasked = unmasked.replace(token, ent)
+        unmasked = unmasked.replace(token.lower(), ent)
+    return unmasked
 
 # 1. 显卡防爆异步信号量队列（控制并发为 3，多余请求平滑排队缓冲）
 concurrency_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENCY)
@@ -249,23 +295,43 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     # 3. 术语库智能屈折变化模糊匹配
     matched_terms = find_matching_terms(user_content)
     
-    # 4. 组装 System 提示词增强块（精简强力，杜绝 7B 模型复读与幻觉）
+    keep_original_terms = [t for t in matched_terms if is_keep_original_term(t["source"], t["target"])]
+    translate_terms = [t for t in matched_terms if not is_keep_original_term(t["source"], t["target"])]
+    user_translate_sources = {t["source"].lower() for t in translate_terms}
+
+    # 4. 提取需进行无损占位符保护的实体列表（用户指定的保持原词 + 自动检测的英文人名）
+    entities_to_protect = [t["source"] for t in keep_original_terms]
+    if settings.KEEP_NAMES_UNTRANSLATED:
+        detected_names = extract_untranslated_entities(user_content_clean, exclude_set=user_translate_sources)
+        for d in detected_names:
+            if d not in entities_to_protect:
+                entities_to_protect.append(d)
+
+    # 对输入消息执行前置占位保护（彻底阻断模型擅自将英文人名音译为中文或替换为全名）
+    entity_mapping = {}
+    if entities_to_protect:
+        for m in messages:
+            if m.get("role") == "user":
+                c_text = m.get("content", "")
+                if isinstance(c_text, str):
+                    masked_c, m_map = mask_untranslated(c_text, entities_to_protect)
+                    m["content"] = masked_c
+                    entity_mapping.update(m_map)
+
+    # 5. 组装 System 提示词增强块（精简强力，杜绝 7B 模型复读与幻觉）
     injection_parts = []
     
-    # 英文人名与球员姓名保持原文处理规则
-    if settings.KEEP_NAMES_UNTRANSLATED:
+    if entity_mapping:
         injection_parts.append(
-            "【英文人名处理规则】：所有英文人名、球员姓名、用户ID昵称（如 Yaxel, Curry, Klay, Luka, Butler, LeBron 等）在译文中必须严格保留英文原文，严禁音译为中文，更严禁擅自扩写为全名。"
+            "【专有代号保护规则】：文本中出现的形如 __P_0__, __P_1__ 为受保护的英文人名或专有代号，在中文译文中必须原样保留该代号，绝对禁止翻译或修改该代号。"
         )
 
     # 语境提示：仅在有效且主题明确时注入，单行极简
     if active_ctx and active_ctx.get("topic"):
         topic_clean = active_ctx.get("topic", "").strip()
-        # 基础相关性校验：若语境是篮球论坛，但文本明显完全不相关，则不硬塞
         is_context_relevant = True
         domain_str = active_ctx.get("domain", "")
         if "篮球" in domain_str or "warriors" in topic_clean.lower() or "nba" in topic_clean.lower():
-            # 只有文本包含基本体育/篮球/比赛词汇时才视作相关
             basketball_keywords = ["nba", "ball", "shot", "game", "point", "court", "coach", "play", "team", "score", "foul", "dunk", "rebound", "assist", "quarter", "lead", "win", "lose", "warriors", "lakers", "celtics", "curry", "lebron"]
             if not any(k in user_content.lower() for k in basketball_keywords):
                 is_context_relevant = False
@@ -275,33 +341,18 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                 f"【语境参考】：当前正在阅读关于《{topic_clean}》的内容，请保持对应领域的专业用词与地道风格。"
             )
 
-    # 术语提示：区分【保持英文不翻译】与【专业术语翻译对照】
-    if matched_terms:
-        keep_original_rules = []
-        translate_rules = []
+    # 术语提示：仅注入需要翻译的专业术语映射表
+    if translate_terms:
+        term_rules = []
+        for t in translate_terms[:25]:
+            note_str = f" ({t['note']})" if t.get("note") else ""
+            term_rules.append(f"  * \"{t['source']}\" -> \"{t['target']}\"{note_str}")
+        term_text = "\n".join(term_rules)
+        injection_parts.append(
+            f"【专业术语映射表（遇到对应词汇请准确对照翻译）】：\n{term_text}"
+        )
 
-        for t in matched_terms[:25]:
-            src = t["source"].strip()
-            tgt = t["target"].strip()
-            if is_keep_original_term(src, tgt):
-                keep_original_rules.append(f'  * "{src}"（必须在译文中严格保留英文原词 "{src}"，绝对禁止音译为中文或替换为全名）')
-            else:
-                note_str = f" ({t['note']})" if t.get("note") else ""
-                translate_rules.append(f'  * "{src}" -> "{tgt}"{note_str}')
-
-        if keep_original_rules:
-            injection_parts.append(
-                "【严禁翻译/强制保持英文原词清单（在译文中必须严格保留英文原文，绝对禁止音译、直译或替换为任何中文全名）】：\n"
-                + "\n".join(keep_original_rules)
-            )
-
-        if translate_rules:
-            injection_parts.append(
-                "【专业术语映射表（遇到对应词汇请准确对照翻译）】：\n"
-                + "\n".join(translate_rules)
-            )
-
-    # 5. 把注入块插入到 messages 的首位 System Prompt 中
+    # 6. 把注入块插入到 messages 的首位 System Prompt 中
     if injection_parts:
         injection_content = "\n\n".join(injection_parts) + "\n\n请严格只输出对应中文翻译结果，严禁输出任何多余解释、前缀说明或未要求的符号。"
         system_idx = -1
@@ -320,7 +371,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                 "content": "你是一个资深精通特定领域文化的专业翻译专家。\n\n" + injection_content
             })
 
-    # 6. 构造转发载荷
+    # 7. 构造转发载荷
     upstream_payload = {
         **body,
         "model": settings.DEFAULT_MODEL,
@@ -415,8 +466,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                                     except:
                                         pass
 
-                            # 模型流结束，执行严格协议清洗与超出 ID 截断
+                            # 模型流结束，执行严格协议清洗、超出 ID 截断，并还原受保护的英文人名
                             final_cleaned = clean_marker_protocol_response(user_content_clean, accumulated_response)
+                            if entity_mapping:
+                                final_cleaned = unmask_untranslated(final_cleaned, entity_mapping)
                             now_ts = int(datetime.now().timestamp())
                             clean_chunk = {
                                 "id": f"chatcmpl-sub-{now_ts}",
@@ -439,6 +492,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                     await client.aclose()
                     if user_content_clean and accumulated_response.strip():
                         final_res = clean_marker_protocol_response(user_content_clean, accumulated_response) if is_marker_mode else accumulated_response
+                        if entity_mapping:
+                            final_res = unmask_untranslated(final_res, entity_mapping)
                         record_live_log({
                             "type": "MODEL_STREAM",
                             "stream": True,
@@ -469,7 +524,9 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                 if user_content_clean and translated_content.strip():
                     if "[[p" in user_content_clean:
                         translated_content = clean_marker_protocol_response(user_content_clean, translated_content)
-                        data["choices"][0]["message"]["content"] = translated_content
+                    if entity_mapping:
+                        translated_content = unmask_untranslated(translated_content, entity_mapping)
+                    data["choices"][0]["message"]["content"] = translated_content
 
                     record_live_log({
                         "type": "MODEL_NON_STREAM",
