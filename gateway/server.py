@@ -298,19 +298,20 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     # 0. 原生协议模式（手机端 AI 字幕补丁等自带 JSON Schema 的客户端）：
     #    这类客户端在自己的 System Prompt 里已写死输出协议，任何额外注入
     #    （语境 / 术语 / “只输出译文”）都会破坏其 JSON 解析，因此整段跳过注入与缓存。
-    #    进入方式：请求带 response_format，或直接把 API URL 指到 /v1/plain/chat/completions。
-    is_plain_mode = (
-        request.url.path.rstrip("/").endswith("/v1/plain/chat/completions")
-        or bool(body.get("response_format"))
-    )
+    #    is_plain_path：只有显式走 /v1/plain/ 的请求才会进 shim/passthrough（手机）。
+    #    is_plain_mode：额外包含「带 response_format」的客户端，仅用于跳过注入/缓存。
+    is_plain_path = request.url.path.rstrip("/").endswith("/v1/plain/chat/completions")
+    is_plain_mode = is_plain_path or bool(body.get("response_format"))
+    # 整轨方案（B）已下线：只有 GATEWAY_SHIM=0 时才启用它的命中/日志逻辑
+    _legacy_track = os.getenv("GATEWAY_SHIM", "1").lower() not in ("true", "1", "yes")
 
     # 0.1 透明转发模式：只对手机 plain 路径生效，桌面版沉浸式翻译仍走原来的注入/缓存链路。
     #     目的：把网关当成一根钩子，只记录原版客户端真实的行为与耗时。
-    if is_plain_mode and os.getenv("GATEWAY_PASSTHROUGH", "0").lower() in ("true", "1", "yes"):
+    if is_plain_path and os.getenv("GATEWAY_PASSTHROUGH", "0").lower() in ("true", "1", "yes"):
         return await _passthrough(body, stream)
 
     # 0.2 协议适配层：网关自己切句 + 编号批量翻译，替 App 保证“引文完整划分 source_text”。
-    if is_plain_mode and os.getenv("GATEWAY_SHIM", "1").lower() in ("true", "1", "yes"):
+    if is_plain_path and os.getenv("GATEWAY_SHIM", "1").lower() in ("true", "1", "yes"):
         _shim_req = None
         for m in messages:
             c = m.get("content")
@@ -372,11 +373,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     #    这类客户端在自己的 System Prompt 里已写死输出协议，任何额外注入
     #    （语境 / 术语 / “只输出译文”）都会破坏其 JSON 解析，因此整段跳过注入与缓存。
     #    进入方式：请求带 response_format，或直接把 API URL 指到 /v1/plain/chat/completions。
-    is_plain_mode = (
-        request.url.path.rstrip("/").endswith("/v1/plain/chat/completions")
-        or bool(body.get("response_format"))
-    )
-    
+    #    （is_plain_mode / is_plain_path 已在函数开头计算）
+
     # 提取待翻译文本内容
     user_content = ""
     for m in messages:
@@ -390,9 +388,9 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                         user_content += " " + part.get("text", "")
     user_content_clean = user_content.strip()
 
-    # 0.5 整轨预翻译命中（B 路线）：手机端逐块请求时，直接返回已翻好的整轨译文。
+    # 0.5 整轨预翻译命中（B 路线，已下线，仅 GATEWAY_SHIM=0 时生效）：
     #     只对「JSON 块请求」生效（带 source_text），且需要该视频已被 /yt/track 或 /yt/warm 预热。
-    if is_plain_mode and user_content_clean.startswith("{"):
+    if _legacy_track and is_plain_mode and user_content_clean.startswith("{"):
         try:
             req_obj = json.loads(user_content_clean)
         except Exception:
@@ -498,7 +496,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     active_ctx = get_active_context()
 
     # 1.5 走到这里说明整轨缓存没命中：要真的调模型了（慢路径，必须记录）
-    if is_plain_mode and user_content_clean.startswith("{"):
+    if _legacy_track and is_plain_mode and user_content_clean.startswith("{"):
         try:
             from gateway import yt_subs as _ys2
             _ys2.log_event("REQ_MODEL", n=len(user_content_clean))

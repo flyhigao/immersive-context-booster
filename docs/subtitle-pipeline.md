@@ -273,3 +273,97 @@ systemctl restart immersive-translator
 | 11-01 00:20 | 透明模式实测：模型抄输入、0.8→7.3s 递增 | 原版协议 + 本地 7B 不可用 |
 | 11-01 00:40 | 协议适配层 `shim.py` 上线 | avg 554ms，repeats 0ms |
 | 11-01 01:00 | 实播 12 分钟 + 多次拖动：流畅 | **定稿：方案 D** |
+
+---
+
+## 8. 桌面版与手机版：两套体系的关系
+
+同一个网关进程里跑两条互斥的链路，**按 URL 路径分流**，不靠猜测：
+
+| | 桌面浏览器（沉浸式翻译扩展） | 手机（Morphe AI 字幕） |
+|---|---|---|
+| 入口 | `POST /v1/chat/completions` | `POST /v1/plain/chat/completions` |
+| 判定 | `is_plain_path = path.endswith("/v1/plain/...")` | 同左 |
+| 处理 | 语境分析 + 术语注入 + 占位符保护 + 高频缓存 | 协议适配层 `shim.py`（切句 + 编号批量 + LRU） |
+| 是否整轨 | 否 | 否（整轨已下线） |
+| 输出 | 纯译文 | `{block, events:[{source,text}]}` |
+| 状态 | 术语库/语境库（`terms.db`） | 无状态（仅内存 LRU） |
+
+**不会冲突的三个理由：**
+
+1. 分流是**路径级**的，不是内容猜测：`GATEWAY_SHIM` / `GATEWAY_PASSTHROUGH` 只对 `/v1/plain/` 生效；
+   桌面请求即使带 `response_format` 也不会被 shim 接管（只跳过注入/缓存）。
+2. 状态不共享：术语库只服务桌面；shim 的 LRU 只服务手机；整轨表（`subs.db`）在 shim 模式完全不读。
+3. 唯一共享的是**上游模型**（hy7b，llama.cpp 4 slot）。
+
+隔离实测（同一分钟连续三个请求）：
+
+```
+plain 路径              → {"block":"b0_x","events":[...]}     373ms
+普通路径                → 纯译文（走桌面链路）                 92ms
+普通路径 + response_format → 纯译文（仍走桌面链路）            260ms
+日志：只有 plain 请求产生 SHIM 记录，无 REQ_* 噪声
+```
+
+并发实测（4 slot 模型）：
+
+```
+4 路字幕并发        各 520~580ms，整体 626ms
+4 路字幕 + 1 路桌面  字幕 191/192ms（部分命中 LRU）+ 桌面 438ms，整体 442ms
+```
+
+> 也就是说：**同时用桌面翻译和手机字幕时，会共用 4 个模型 slot，极端并发下互相排队**，
+> 但正常使用（一次播放 + 偶尔网页翻译）感知不到。
+
+---
+
+## 9. 稳定性与开机自启（2026-11-01 核查）
+
+### 服务单元
+
+```ini
+# /etc/systemd/system/immersive-translator.service
+[Unit]
+Description=Immersive Translator Context & Term Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/immersive-translator-gateway
+EnvironmentFile=/opt/immersive-translator-gateway/.env
+ExecStart=/opt/immersive-translator-gateway/.venv/bin/python3 -m uvicorn gateway.server:app --host 0.0.0.0 --port 8787
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+| 核查项 | 结果 |
+|---|---|
+| 开机自启 | `enabled`，`/etc/systemd/system/multi-user.target.wants/immersive-translator.service` 符号链接存在 |
+| 崩溃自愈 | `Restart=always` + `RestartSec=3` |
+| 本次启动后错误 | **0**（`Traceback/ERROR/CRITICAL` 计数为 0） |
+| 内存 | ~37 MB（稳定，无增长趋势） |
+| 配置来源 | `EnvironmentFile=.env`（`GATEWAY_SHIM=1` 持久化在文件里，不依赖 shell 环境） |
+| 路径 | 全部绝对路径；`.venv/bin/python3` 为符号链接到 `/usr/bin/python3` |
+| 数据 | `/opt/immersive-translator-gateway/data/` 持久化（`terms.db`、`subs.db`、`yt_debug.log`） |
+| 重启后状态 | 无内存态依赖：LRU 丢失只影响首次命中（几十 ms），不影响功能 |
+
+### 附带的自启单元
+
+```ini
+# /etc/systemd/system/router-passwall-socks.service  （SSH 隧道 → 路由器 SOCKS）
+After=network-online.target
+Wants=network-online.target
+Restart=always
+```
+
+`enabled`，开机自动拉起；**shim 模式下并不需要它**（只有整轨方案才用代理抓字幕），
+保留是因为回滚整轨方案时可以直接用。它的免密依赖 `/root/.ssh/id_rsa`（已存在，实测 `ssh root@192.168.2.1` 免密可用）。
+
+### 已知的两个小隐患（不影响使用）
+
+1. `data/gateway_live.log` 会一直增长（当前 3.5MB，无轮转）—— 需要的话加 `logrotate`；
+2. 上游模型 4 个 slot 由两条链路共享，见 §8 的并发实测。
