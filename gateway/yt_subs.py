@@ -52,7 +52,7 @@ def any_warming(max_age_s: int = 600) -> bool:
 
 def progress(video_id: str) -> Dict[str, Any]:
     p = PROGRESS.get(video_id)
-    if p and p.get("state") in ("working", "done", "error"):
+    if p and p.get("state") in ("queued", "fetching", "working", "done", "error"):
         total = max(1, p.get("total", 0))
         return {
             "state": p.get("state", "working"),
@@ -106,8 +106,21 @@ def cache_put(video_id: str, src: str, tgt: str, payload: Dict[str, Any]) -> Non
         conn.close()
 
 
+_LAST_FETCH = [0.0]
+MIN_FETCH_INTERVAL = float(os.getenv("YT_MIN_FETCH_INTERVAL", "5"))
+COOKIES_FILE = os.getenv("YT_COOKIES_FILE", "/opt/immersive-translator-gateway/data/yt-cookies.txt")
+
+
 def fetch_track(video_id: str, src_lang: str = "en") -> Optional[Dict[str, Any]]:
-    """用 yt-dlp 抓整条 json3 字幕轨（人工轨优先，没有则自动字幕）。"""
+    """用 yt-dlp 抓整条 json3 字幕轨（人工轨优先，没有则自动字幕）。
+    429 是 IP 级限流：串行 + 退避重试，避免越抓越慢。"""
+    import random
+
+    wait = MIN_FETCH_INTERVAL - (time.time() - _LAST_FETCH[0])
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_FETCH[0] = time.time()
+
     os.makedirs(YTDLP_DIR, exist_ok=True)
     for f in os.listdir(YTDLP_DIR):
         if f.startswith(video_id):
@@ -125,12 +138,23 @@ def fetch_track(video_id: str, src_lang: str = "en") -> Optional[Dict[str, Any]]
         "-o", os.path.join(YTDLP_DIR, "%(id)s.%(ext)s"),
         f"https://www.youtube.com/watch?v={video_id}",
     ]
-    subprocess.run(cmd, capture_output=True, timeout=120)
+    if os.path.exists(COOKIES_FILE):
+        cmd[3:3] = ["--cookies", COOKIES_FILE]
 
-    for f in os.listdir(YTDLP_DIR):
-        if f.startswith(video_id) and f.endswith(".json3"):
-            with open(os.path.join(YTDLP_DIR, f), encoding="utf-8") as fh:
-                return json.load(fh)
+    for attempt, backoff in enumerate((0, 3, 12, 30)):
+        if backoff:
+            time.sleep(backoff + random.uniform(0, 2))
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        err = (proc.stderr or "") + (proc.stdout or "")
+        for f in os.listdir(YTDLP_DIR):
+            if f.startswith(video_id) and f.endswith(".json3"):
+                path = os.path.join(YTDLP_DIR, f)
+                if os.path.getsize(path) > 64:
+                    with open(path, encoding="utf-8") as fh:
+                        return json.load(fh)
+        if "429" not in err:
+            break
+        _LAST_FETCH[0] = time.time()
     return None
 
 
@@ -259,6 +283,7 @@ async def translate_track(video_id: str, src: str = "en", tgt: str = TARGET_LANG
     PROGRESS[video_id] = {"state": "fetching", "total": 0, "done": 0, "t0": time.time()}
     track = await asyncio.to_thread(fetch_track, video_id, src)
     if not track:
+        PROGRESS[video_id] = {"state": "error", "total": 0, "done": 0, "t0": time.time()}
         return {"error": "no_caption_track", "video_id": video_id}
 
     cues = _cues(track)
