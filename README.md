@@ -120,6 +120,13 @@ adb reverse --list              # 重新插拔 USB 后需要重跑
    - 搜索、添加、编辑、删除术语；
    - 一键导出术语库 JSON。
 
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/subtitle-pipeline.md`](docs/subtitle-pipeline.md) | **Android 字幕链路四种实现的实测数据、优劣对比、当前运行哪一种、如何切换与回滚** |
+| `immersive-context-booster`（本仓库） | 网关本体：注入/术语/缓存（桌面版）+ 协议适配层（手机字幕） |
+
 ## Android 字幕：协议适配层（当前推荐，2026-11）
 
 `gateway/shim.py` 用于手机端 AI 字幕（Morphe RebuildProtocol）：
