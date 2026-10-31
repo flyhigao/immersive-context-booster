@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from gateway.config import settings
+from gateway import shim
 from gateway.db import (
     init_db,
     get_all_terms,
@@ -197,7 +198,6 @@ class TermRequest(BaseModel):
     source_url: str = ""
 
 # ----------------- 沉浸式翻译 OpenAI 兼容代理 -----------------
-
 @router.get("/v1/models")
 @router.get("/v1/plain/models")
 async def get_models():
@@ -209,6 +209,76 @@ async def get_models():
             {"id": "hy1.8b", "object": "model", "owned_by": "custom-gateway"}
         ]
     }
+
+async def _passthrough(body: Dict[str, Any], stream: bool):
+    """原样转发给上游 /chat/completions，只记录耗时与 token 用量。"""
+    url = f"{settings.UPSTREAM_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.UPSTREAM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    chars = 0
+    for m in body.get("messages", []):
+        c = m.get("content")
+        if isinstance(c, str):
+            chars += len(c)
+        elif isinstance(c, list):
+            chars += sum(len(p.get("text", "")) for p in c if isinstance(p, dict))
+    t0 = time.time()
+    last_user = ""
+    for m in reversed(body.get("messages", [])):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            last_user = m["content"]
+            break
+    n_sys = sum(1 for m in body.get("messages", []) if m.get("role") == "system")
+
+    try:
+        from gateway import yt_subs as _ys
+        _log = _ys.log_event
+    except Exception:
+        _log = lambda *a, **k: None
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=15.0))
+    if not stream:
+        try:
+            resp = await client.post(url, headers=headers, json=body)
+            ms = round((time.time() - t0) * 1000)
+            data = resp.json() if resp.status_code == 200 else {}
+            usage = data.get("usage", {})
+            reply = ""
+            try:
+                reply = data["choices"][0]["message"]["content"][:300]
+            except Exception:
+                pass
+            _log("PT", ms=ms, chars=chars, status=resp.status_code, sys=n_sys,
+                 prompt=usage.get("prompt_tokens"), out=usage.get("completion_tokens"),
+                 in_head=last_user[:100], reply=reply)
+            return JSONResponse(content=data, status_code=resp.status_code)
+        finally:
+            await client.aclose()
+
+    req = client.build_request("POST", url, headers=headers, json=body)
+    resp = await client.send(req, stream=True)
+    first = {"t": None, "buf": []}
+
+    async def gen():
+        try:
+            async for chunk in resp.aiter_raw():
+                if first["t"] is None:
+                    first["t"] = round((time.time() - t0) * 1000)
+                if len(first["buf"]) < 2000:
+                    first["buf"].append(chunk)
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+            head = b"".join(first["buf"])[:400].decode("utf-8", "ignore")
+            _log("PT", stream=True, ms=round((time.time() - t0) * 1000),
+                 ttfb=first["t"], chars=chars, status=resp.status_code, sys=n_sys,
+                 in_head=last_user[:100], reply=head)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
 
 @router.post("/v1/chat/completions")
 @router.post("/v1/plain/chat/completions")
@@ -224,6 +294,79 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
     messages = body.get("messages", [])
     stream = body.get("stream", False)
+
+    # 0. 原生协议模式（手机端 AI 字幕补丁等自带 JSON Schema 的客户端）：
+    #    这类客户端在自己的 System Prompt 里已写死输出协议，任何额外注入
+    #    （语境 / 术语 / “只输出译文”）都会破坏其 JSON 解析，因此整段跳过注入与缓存。
+    #    进入方式：请求带 response_format，或直接把 API URL 指到 /v1/plain/chat/completions。
+    is_plain_mode = (
+        request.url.path.rstrip("/").endswith("/v1/plain/chat/completions")
+        or bool(body.get("response_format"))
+    )
+
+    # 0.1 透明转发模式：只对手机 plain 路径生效，桌面版沉浸式翻译仍走原来的注入/缓存链路。
+    #     目的：把网关当成一根钩子，只记录原版客户端真实的行为与耗时。
+    if is_plain_mode and os.getenv("GATEWAY_PASSTHROUGH", "0").lower() in ("true", "1", "yes"):
+        return await _passthrough(body, stream)
+
+    # 0.2 协议适配层：网关自己切句 + 编号批量翻译，替 App 保证“引文完整划分 source_text”。
+    if is_plain_mode and os.getenv("GATEWAY_SHIM", "1").lower() in ("true", "1", "yes"):
+        _shim_req = None
+        for m in messages:
+            c = m.get("content")
+            if m.get("role") == "user" and isinstance(c, str) and c.strip().startswith("{"):
+                try:
+                    _obj = json.loads(c)
+                except Exception:
+                    _obj = None
+                if isinstance(_obj, dict) and isinstance(_obj.get("source_text"), str):
+                    _shim_req = _obj
+                break
+        if _shim_req is not None and not _shim_req["source_text"].strip().lower().startswith("this is a subtitle test"):
+            try:
+                t0 = time.time()
+                out = await shim.translate_block(_shim_req, _shim_req.get("language") or "zh-Hans")
+                if out is not None:
+                    try:
+                        from gateway import yt_subs as _ys
+                        _ys.log_event("SHIM", ms=round((time.time() - t0) * 1000),
+                                      block=_shim_req.get("block"),
+                                      chars=len(_shim_req["source_text"]),
+                                      events=len(out["events"]),
+                                      cache=out.get("_cache") == "hit",
+                                      head=_shim_req["source_text"][:60])
+                    except Exception:
+                        pass
+                    content = json.dumps(out, ensure_ascii=False)
+                    if stream:
+                        async def _shim_stream(c=content):
+                            now = int(datetime.now().timestamp())
+                            yield "data: " + json.dumps({
+                                "id": f"chatcmpl-shim-{now}", "object": "chat.completion.chunk",
+                                "created": now, "model": settings.DEFAULT_MODEL,
+                                "choices": [{"index": 0, "delta": {"content": c}, "finish_reason": None}],
+                            }) + "\r\n\r\n"
+                            yield "data: " + json.dumps({
+                                "id": f"chatcmpl-shim-{now}", "object": "chat.completion.chunk",
+                                "created": now, "model": settings.DEFAULT_MODEL,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            }) + "\r\n\r\n"
+                            yield "data: [DONE]\r\n\r\n"
+                        return StreamingResponse(_shim_stream(), media_type="text/event-stream")
+                    return JSONResponse({
+                        "id": f"chatcmpl-shim-{int(datetime.now().timestamp())}",
+                        "object": "chat.completion", "model": settings.DEFAULT_MODEL,
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
+                                      "finish_reason": "stop"}],
+                    })
+                try:
+                    from gateway import yt_subs as _ys
+                    _ys.log_event("SHIM_FAIL", block=_shim_req.get("block"),
+                                  chars=len(_shim_req["source_text"]))
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[Gateway] shim failed: {e}")
 
     # 0. 原生协议模式（手机端 AI 字幕补丁等自带 JSON Schema 的客户端）：
     #    这类客户端在自己的 System Prompt 里已写死输出协议，任何额外注入
@@ -258,16 +401,32 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
             try:
                 from gateway import yt_subs
                 hit = yt_subs.cue_lookup(req_obj["source_text"])
+                if not hit:
+                    # block 常常跨多条字幕，拼起来才能命中
+                    hit = yt_subs.compose_lookup(req_obj["source_text"])
             except Exception as e:
                 hit = None
                 print(f"[Gateway] track cache lookup failed: {e}")
             _src = (req_obj.get("source_text") or "").strip().lower()
             _is_probe = _src.startswith("this is a subtitle test")
-            if (not hit and not _is_probe
+            if hit:
+                try:
+                    yt_subs.log_event("REQ_HIT", block=req_obj.get("block"), vid=hit.get("video_id"),
+                                      idx=hit.get("idx"), score=hit.get("score"), n=len(_src))
+                except Exception:
+                    pass
+            elif not _is_probe:
+                try:
+                    _hold = yt_subs.should_hold(req_obj["source_text"])
+                    yt_subs.log_event("REQ_MISS", block=req_obj.get("block"), n=len(_src),
+                                      hold=_hold, text=req_obj["source_text"][:80])
+                except Exception:
+                    _hold = False
+            if (not hit and not _is_probe and _hold
                     and os.getenv("YT_HOLD_WHILE_WARMING", "true").lower() in ("true", "1", "yes")):
                 try:
                     from gateway import yt_subs as _ys
-                    if _ys.any_warming():
+                    if True:
                         content = json.dumps({"block": req_obj.get("block", ""), "events": []}, ensure_ascii=False)
                         record_live_log({"type": "TRACK_WARMING_HOLD", "stream": stream,
                                          "user_input": user_content_clean, "output": content})
@@ -337,6 +496,16 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
 
     # 1. 查询当前活跃网页/视频全局上下文
     active_ctx = get_active_context()
+
+    # 1.5 走到这里说明整轨缓存没命中：要真的调模型了（慢路径，必须记录）
+    if is_plain_mode and user_content_clean.startswith("{"):
+        try:
+            from gateway import yt_subs as _ys2
+            _ys2.log_event("REQ_MODEL", n=len(user_content_clean))
+            record_live_log({"type": "TRACK_MODEL_FALLBACK", "stream": stream,
+                             "user_input": user_content_clean[:400], "output": ""})
+        except Exception:
+            pass
 
     # 2. 检查本地高频缓存 (Cache)
     cache_key = ""
@@ -764,6 +933,69 @@ async def yt_status(v: str):
     return {"video_id": vid, **yt_subs.progress(vid)}
 
 
+@router.get("/yt/debug")
+async def yt_debug(limit: int = 40):
+    """实时查看：当前激活视频、各视频预热状态、最近调试日志。"""
+    from gateway import yt_subs
+
+    tail: List[str] = []
+    try:
+        with open(yt_subs.LOG_PATH, encoding="utf-8") as fh:
+            tail = fh.read().splitlines()[-limit:]
+    except Exception:
+        pass
+    return {
+        "active": yt_subs.ACTIVE,
+        "window_seconds": yt_subs.WINDOW_SECONDS,
+        "proxy": yt_subs.YT_PROXY or None,
+        "progress": {k: yt_subs.progress(k) for k in list(yt_subs.PROGRESS)[-10:]},
+        "log": tail,
+    }
+
+
+@router.get("/yt/debug/clear")
+async def yt_debug_clear():
+    from gateway import yt_subs
+    try:
+        open(yt_subs.LOG_PATH, "w", encoding="utf-8").close()
+    except Exception:
+        pass
+    return {"status": "ok"}
+
+
+@router.get("/yt/debug/summary")
+async def yt_debug_summary(lines: int = 5000):
+    """统计最近日志：命中/hold/调模型各多少次、各耗时多少。"""
+    from gateway import yt_subs
+
+    counts: Dict[str, int] = {}
+    batch_secs: List[float] = []
+    try:
+        with open(yt_subs.LOG_PATH, encoding="utf-8") as fh:
+            raw = fh.read().splitlines()[-lines:]
+    except Exception:
+        raw = []
+    for ln in raw:
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        ev = rec.get("event", "?")
+        counts[ev] = counts.get(ev, 0) + 1
+        if ev == "BATCH" and rec.get("secs"):
+            batch_secs.append(float(rec["secs"]))
+    total_req = counts.get("REQ_HIT", 0) + counts.get("REQ_MISS", 0)
+    held = counts.get("REQ_MISS", 0)
+    return {
+        "counts": counts,
+        "requests": total_req,
+        "model_calls": counts.get("REQ_MODEL", 0),
+        "batches": len(batch_secs),
+        "batch_secs_avg": round(sum(batch_secs) / len(batch_secs), 2) if batch_secs else 0,
+        "batch_secs_max": round(max(batch_secs), 2) if batch_secs else 0,
+    }
+
+
 @router.get("/yt/", response_class=HTMLResponse)
 async def yt_page():
     """手机端预热页：粘贴视频链接 → 后台整轨翻译 → 显示进度。"""
@@ -831,11 +1063,20 @@ async def yt_warm(v: str, src: str = "en", tgt: str = "zh-Hans", background_task
     if not vid:
         raise HTTPException(status_code=400, detail="invalid_video")
 
+    # 协议适配层模式下不需要整轨预热（会白占模型 slot，反而拖慢逐块翻译）
+    if os.getenv("GATEWAY_SHIM", "1").lower() in ("true", "1", "yes"):
+        return {"status": "disabled", "video_id": vid, "reason": "shim_mode"}
+
+    # 当前在看的视频：hold 只针对这个视频，其他视频预热不会把字幕卡成“翻译中”
+    yt_subs.set_active(vid)
+
     cur = yt_subs.PROGRESS.get(vid)
     if cur and cur.get("state") in ("queued", "fetching", "working"):
+        yt_subs.log_event("WARM_DUP", vid=vid, state=cur.get("state"))
         return {"status": "already", "video_id": vid}
 
     yt_subs.PROGRESS[vid] = {"state": "queued", "total": 0, "done": 0, "t0": time.time()}
+    yt_subs.log_event("WARM_START", vid=vid, src=src, tgt=tgt)
 
     async def _run():
         await yt_subs.translate_track(vid, src, tgt)

@@ -119,3 +119,20 @@ adb reverse --list              # 重新插拔 USB 后需要重跑
    - 查看当前生效的网页语境；
    - 搜索、添加、编辑、删除术语；
    - 一键导出术语库 JSON。
+
+## Android 字幕：协议适配层（当前推荐，2026-11）
+
+`gateway/shim.py` 用于手机端 AI 字幕（Morphe RebuildProtocol）：
+
+- App 要求回复里的 `source` 引文**逐字完整划分** `source_text`，7B 模型做不到 →
+  频繁重试 → 一直「翻译中」
+- shim 由**网关自己切句**，模型只做「第 N 行 → 译文」，网关再拼回 App 的 JSON
+- 实测：41 次请求 avg 554ms / p90 920ms / max 1.45s，无重试
+- 完全不走术语注入、语境注入、整轨缓存
+
+| 开关 | 默认 | 说明 |
+|---|---|---|
+| `GATEWAY_SHIM` | `1` | 协议适配层 |
+| `GATEWAY_PASSTHROUGH` | `0` | 1 = 透明转发，只记日志 |
+| `SHIM_BATCH_CHARS` | `600` | 每批字符上限 |
+| `SHIM_LRU_MAX` / `SHIM_LRU_TTL` | `512` / `1800` | 完全相同块的内存缓存 |
