@@ -334,7 +334,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                                       block=_shim_req.get("block"),
                                       chars=len(_shim_req["source_text"]),
                                       events=len(out["events"]),
-                                      cache=out.get("_cache") == "hit",
+                                      cache=out.get("_cache") in ("hit", "same_lang"),
+                                      same_lang=out.get("_cache") == "same_lang",
                                       head=_shim_req["source_text"][:60])
                     except Exception:
                         pass

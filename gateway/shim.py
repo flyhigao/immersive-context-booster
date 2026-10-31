@@ -128,11 +128,39 @@ def _chunks(lines: List[str], limit: int) -> List[List[int]]:
     return out
 
 
+def _cjk_ratio(text: str) -> float:
+    """非空白字符里中日韩字符的占比。"""
+    chars = [c for c in (text or "") if not c.isspace()]
+    if not chars:
+        return 0.0
+    cjk = sum(1 for c in chars if "\u4e00" <= c <= "\u9fff" or "\u3400" <= c <= "\u4dbf")
+    return cjk / len(chars)
+
+
+def _already_target(text: str, tgt: str) -> bool:
+    """源文本已经是目标语言（目前只判中→中）就不该再翻一遍。"""
+    if not os.getenv("SHIM_SKIP_SAME_LANGUAGE", "1").lower() in ("true", "1", "yes"):
+        return False
+    base = (tgt or "").lower()
+    if base.startswith("zh"):
+        return _cjk_ratio(text) >= 0.5
+    if base.startswith("en"):
+        return _cjk_ratio(text) < 0.05 and len(text.strip()) > 8
+    return False
+
+
 async def translate_block(req: Dict[str, Any], tgt: str = "zh-Hans") -> Optional[Dict[str, Any]]:
     """把一个 block 翻成 {block, events:[{source,text}]}；失败返回 None（由调用方回落到直通）。"""
     text = req.get("source_text")
     if not isinstance(text, str) or not text.strip():
         return None
+
+    # 源文本已经是目标语言：直接透传，0 模型调用（中文视频不该再翻一遍）
+    if _already_target(text, tgt):
+        clauses = split_clauses(text) or [text]
+        return {"block": req.get("block", ""),
+                "events": [{"source": c, "text": c.strip()} for c in clauses],
+                "_cache": "same_lang"}
 
     key = f"{tgt}\u0000{text}"
     cached = _LRU.get(key)
