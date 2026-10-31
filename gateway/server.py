@@ -3,12 +3,13 @@ import re
 import json
 import asyncio
 import hashlib
+import time
 from datetime import datetime
 from collections import deque
 import httpx
 from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, APIRouter, Request, BackgroundTasks, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -31,6 +32,28 @@ from gateway.db import (
 from gateway.analyzer import analyze_web_or_video, extract_terms_from_translation
 
 app = FastAPI(title="Immersive Context & Term Booster Gateway")
+
+
+class UpstreamHTTPError(Exception):
+    """上游返回 4xx/5xx：保留原始状态码与响应体，供客户端做能力协商（如不支持 response_format 时降级）。"""
+
+    def __init__(self, status_code: int, body: str):
+        self.status_code = status_code
+        self.body = body or ""
+        super().__init__(f"upstream HTTP {status_code}: {self.body[:300]}")
+
+    def payload(self) -> Any:
+        try:
+            return json.loads(self.body)
+        except Exception:
+            return {
+                "error": {
+                    "message": self.body[:2000],
+                    "type": "upstream_error",
+                    "code": self.status_code,
+                }
+            }
+
 
 def clean_marker_protocol_response(input_text: str, raw_text: str) -> str:
     """
@@ -176,6 +199,7 @@ class TermRequest(BaseModel):
 # ----------------- 沉浸式翻译 OpenAI 兼容代理 -----------------
 
 @router.get("/v1/models")
+@router.get("/v1/plain/models")
 async def get_models():
     """提供给沉浸式翻译检测模型列表"""
     return {
@@ -187,6 +211,7 @@ async def get_models():
     }
 
 @router.post("/v1/chat/completions")
+@router.post("/v1/plain/chat/completions")
 async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     """
     核心代理入口：
@@ -199,6 +224,15 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
     messages = body.get("messages", [])
     stream = body.get("stream", False)
+
+    # 0. 原生协议模式（手机端 AI 字幕补丁等自带 JSON Schema 的客户端）：
+    #    这类客户端在自己的 System Prompt 里已写死输出协议，任何额外注入
+    #    （语境 / 术语 / “只输出译文”）都会破坏其 JSON 解析，因此整段跳过注入与缓存。
+    #    进入方式：请求带 response_format，或直接把 API URL 指到 /v1/plain/chat/completions。
+    is_plain_mode = (
+        request.url.path.rstrip("/").endswith("/v1/plain/chat/completions")
+        or bool(body.get("response_format"))
+    )
     
     # 提取待翻译文本内容
     user_content = ""
@@ -213,12 +247,100 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                         user_content += " " + part.get("text", "")
     user_content_clean = user_content.strip()
 
+    # 0.5 整轨预翻译命中（B 路线）：手机端逐块请求时，直接返回已翻好的整轨译文。
+    #     只对「JSON 块请求」生效（带 source_text），且需要该视频已被 /yt/track 或 /yt/warm 预热。
+    if is_plain_mode and user_content_clean.startswith("{"):
+        try:
+            req_obj = json.loads(user_content_clean)
+        except Exception:
+            req_obj = None
+        if isinstance(req_obj, dict) and isinstance(req_obj.get("source_text"), str):
+            try:
+                from gateway import yt_subs
+                hit = yt_subs.cue_lookup(req_obj["source_text"])
+            except Exception as e:
+                hit = None
+                print(f"[Gateway] track cache lookup failed: {e}")
+            _src = (req_obj.get("source_text") or "").strip().lower()
+            _is_probe = _src.startswith("this is a subtitle test")
+            if (not hit and not _is_probe
+                    and os.getenv("YT_HOLD_WHILE_WARMING", "true").lower() in ("true", "1", "yes")):
+                try:
+                    from gateway import yt_subs as _ys
+                    if _ys.any_warming():
+                        content = json.dumps({"block": req_obj.get("block", ""), "events": []}, ensure_ascii=False)
+                        record_live_log({"type": "TRACK_WARMING_HOLD", "stream": stream,
+                                         "user_input": user_content_clean, "output": content})
+                        if stream:
+                            async def hold_stream():
+                                now = int(datetime.now().timestamp())
+                                chunk1 = {
+                                    "id": f"chatcmpl-hold-{now}",
+                                    "object": "chat.completion.chunk",
+                                    "created": now,
+                                    "model": settings.DEFAULT_MODEL,
+                                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+                                }
+                                chunk2 = {
+                                    "id": f"chatcmpl-hold-{now}",
+                                    "object": "chat.completion.chunk",
+                                    "created": now,
+                                    "model": settings.DEFAULT_MODEL,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                }
+                                yield "data: " + json.dumps(chunk1) + "\r\n\r\n"
+                                yield "data: " + json.dumps(chunk2) + "\r\n\r\n"
+                                yield "data: [DONE]\r\n\r\n"
+                            return StreamingResponse(hold_stream(), media_type="text/event-stream")
+                        return JSONResponse({
+                            "id": f"chatcmpl-hold-{int(datetime.now().timestamp())}",
+                            "object": "chat.completion",
+                            "model": settings.DEFAULT_MODEL,
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
+                                          "finish_reason": "stop"}],
+                        })
+                except Exception as e:
+                    print(f"[Gateway] warm-hold check failed: {e}")
+            if hit:
+                content = json.dumps({
+                    "block": req_obj.get("block", ""),
+                    "events": [{"source": req_obj["source_text"], "text": hit["text"]}],
+                }, ensure_ascii=False)
+                record_live_log({
+                    "type": "TRACK_CACHE_HIT",
+                    "stream": stream,
+                    "user_input": user_content_clean,
+                    "output": content,
+                })
+                if stream:
+                    async def track_stream():
+                        now = int(datetime.now().timestamp())
+                        yield "data: " + json.dumps({
+                            "id": f"chatcmpl-track-{now}", "object": "chat.completion.chunk",
+                            "created": now, "model": settings.DEFAULT_MODEL,
+                            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+                        }) + "\r\n\r\n"
+                        yield "data: " + json.dumps({
+                            "id": f"chatcmpl-track-{now}", "object": "chat.completion.chunk",
+                            "created": now, "model": settings.DEFAULT_MODEL,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }) + "\r\n\r\n"
+                        yield "data: [DONE]\r\n\r\n"
+                    return StreamingResponse(track_stream(), media_type="text/event-stream")
+                return JSONResponse({
+                    "id": f"chatcmpl-track-{int(datetime.now().timestamp())}",
+                    "object": "chat.completion",
+                    "model": settings.DEFAULT_MODEL,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
+                                  "finish_reason": "stop"}],
+                })
+
     # 1. 查询当前活跃网页/视频全局上下文
     active_ctx = get_active_context()
 
     # 2. 检查本地高频缓存 (Cache)
     cache_key = ""
-    if settings.ENABLE_CACHE and user_content_clean:
+    if settings.ENABLE_CACHE and user_content_clean and not is_plain_mode:
         ctx_topic = active_ctx.get("topic", "") if active_ctx else ""
         cache_raw = f"{settings.DEFAULT_MODEL}:{ctx_topic}:{user_content_clean}"
         cache_key = hashlib.md5(cache_raw.encode("utf-8")).hexdigest()
@@ -265,8 +387,8 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                     }]
                 })
 
-    # 3. 术语库智能屈折变化模糊匹配
-    matched_terms = find_matching_terms(user_content)
+    # 3. 术语库智能屈折变化模糊匹配（原生协议模式跳过）
+    matched_terms = [] if is_plain_mode else find_matching_terms(user_content)
     
     keep_original_terms = [t for t in matched_terms if is_keep_original_term(t["source"], t["target"])]
     translate_terms = [t for t in matched_terms if not is_keep_original_term(t["source"], t["target"])]
@@ -290,7 +412,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     injection_parts = []
     
     # 英文人名与球员姓名强制保留英文原文铁律
-    if settings.KEEP_NAMES_UNTRANSLATED:
+    if settings.KEEP_NAMES_UNTRANSLATED and not is_plain_mode:
         injection_parts.append(
             "【重要翻译规则 - 英文人名强制保留英文原文】：\n"
             "在翻译中，所有出现的西方人名、球星名字、球员简称（例如 Al Horford, Steph, Curry, Klay, LeBron, Luka, Yaxel 等），在中文译文中必须统一 100% 原样保留英文，严禁音译为中文汉字（例如：Al Horford 绝不能翻译为“霍福德”或“阿尔·霍福德”，必须直接写作 Al Horford；Steph 绝不能翻译为“斯蒂芬”，必须直接写作 Steph；Yaxel 必须直接写作 Yaxel；Curry 必须直接写作 Curry）。严禁将任何人名翻译为中文。"
@@ -300,7 +422,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
         injection_parts.append(
             "【专有代号保护规则】：文本中出现的形如 __P_0__, __P_1__ 为受保护的专有代号，在中文译文中必须原样保留该代号不变。"
         )
-    if active_ctx and active_ctx.get("topic"):
+    if active_ctx and active_ctx.get("topic") and not is_plain_mode:
         topic_clean = active_ctx.get("topic", "").strip()
         is_context_relevant = True
         domain_str = active_ctx.get("domain", "")
@@ -365,8 +487,14 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                 headers=headers,
                 json=payload
             )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # 上游 4xx/5xx 原样上抛：手机端补丁（AI caption translator 等）
+                # 依赖错误文本判断“response_format 不支持”并自动降级，
+                # 不能只包成 502，否则协议协商会失败。
+                raise UpstreamHTTPError(resp.status_code, resp.text)
             return resp.json()
+        except UpstreamHTTPError:
+            raise
         except Exception as e:
             if settings.BACKUP_BASE_URL and settings.BACKUP_API_KEY:
                 print(f"[Gateway] 上游模型异常，自动切换到备用模型通道: {e}")
@@ -517,6 +645,9 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
                             active_ctx.get("domain", "") if active_ctx else ""
                         )
                 return JSONResponse(data)
+            except UpstreamHTTPError as e:
+                await client.aclose()
+                return JSONResponse(status_code=e.status_code, content=e.payload())
             except Exception as e:
                 await client.aclose()
                 raise HTTPException(status_code=502, detail=f"上游模型请求失败: {str(e)}")
@@ -605,6 +736,116 @@ async def api_delete_term(term_id: int):
 async def api_export_terms():
     terms, _ = get_all_terms(limit=10000)
     return JSONResponse(terms)
+
+# ----------------- 整轨字幕预翻译 API（B 路线服务端） -----------------
+
+@router.get("/yt/track")
+async def yt_track(v: str, src: str = "en", tgt: str = "zh-Hans"):
+    """返回整条字幕轨的 json3（已译为 tgt）。首次请求会现拉+现翻，之后走缓存。"""
+    from gateway import yt_subs
+    started = time.time()
+    result = await yt_subs.translate_track(v, src, tgt)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return JSONResponse(
+        content=result["track"],
+        headers={
+            "X-YT-Cues": str(result.get("cues", 0)),
+            "X-YT-Batches": str(result.get("batches", 0)),
+            "X-YT-Elapsed": f"{time.time() - started:.2f}",
+        },
+    )
+
+
+@router.get("/yt/status")
+async def yt_status(v: str):
+    from gateway import yt_subs
+    vid = yt_subs.video_id_from(v) or v
+    return {"video_id": vid, **yt_subs.progress(vid)}
+
+
+@router.get("/yt/", response_class=HTMLResponse)
+async def yt_page():
+    """手机端预热页：粘贴视频链接 → 后台整轨翻译 → 显示进度。"""
+    return HTMLResponse("""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>字幕预热</title>
+<style>
+ body{font-family:system-ui;margin:0;padding:20px;background:#111;color:#eee}
+ h2{font-weight:600;margin:0 0 16px}
+ input{width:100%;box-sizing:border-box;padding:14px;font-size:16px;border-radius:10px;border:1px solid #333;background:#1b1b1b;color:#eee}
+ button{margin-top:12px;width:100%;padding:14px;font-size:17px;border:0;border-radius:10px;background:#2f6fdb;color:#fff}
+ #bar{margin-top:20px;height:14px;background:#222;border-radius:8px;overflow:hidden}
+ #fill{height:100%;width:0;background:#39c07a;transition:width .4s}
+ #txt{margin-top:10px;font-size:15px;color:#9fb3c8}
+</style></head><body>
+<h2>整轨字幕预热</h2>
+<input id="u" placeholder="粘贴 YouTube 链接或视频 ID" />
+<button onclick="go()">开始翻译</button>
+<div id="bar"><div id="fill"></div></div>
+<div id="txt">等待输入</div>
+<script>
+let timer=null;
+async function go(){
+  const v=document.getElementById('u').value.trim();
+  if(!v) return;
+  document.getElementById('txt').textContent='正在预热…';
+  const r=await fetch('warm?v='+encodeURIComponent(v),{method:'POST'});
+  const j=await r.json();
+  poll(j.video_id||v);
+}
+function poll(v){
+  if(timer) clearInterval(timer);
+  timer=setInterval(async()=>{
+    const s=await (await fetch('status?v='+encodeURIComponent(v))).json();
+    if(s.state==='done'){document.getElementById('fill').style.width='100%';
+      document.getElementById('txt').textContent='翻译完成，共 '+(s.total||'?')+' 条，用时 '+(s.elapsed||0)+'s';
+      clearInterval(timer);return;}
+    if(s.state==='unknown'){document.getElementById('txt').textContent='未找到任务';clearInterval(timer);return;}
+    document.getElementById('fill').style.width=(s.percent||0)+'%';
+    document.getElementById('txt').textContent='翻译中… '+(s.done||0)+'/'+(s.total||0)+' 条（'+(s.percent||0)+'%）';
+  },1000);
+}
+</script></body></html>""")
+
+
+@router.get("/yt/resolve")
+async def yt_resolve(title: str, src: str = "en", tgt: str = "zh-Hans"):
+    """按媒体会话标题解析视频并后台预热（给 watch-and-warm 脚本用）。"""
+    from gateway import yt_subs
+    info = await asyncio.to_thread(yt_subs.resolve_by_title, title)
+    if not info:
+        raise HTTPException(status_code=404, detail="not_found")
+    asyncio.create_task(yt_subs.translate_track(info["id"], src, tgt))
+    return {"status": "ok", **info}
+
+
+@router.get("/yt/warm")
+@router.post("/yt/warm")
+async def yt_warm(v: str, src: str = "en", tgt: str = "zh-Hans", background_tasks: BackgroundTasks = None):
+    """后台预热整条字幕轨（v 可以是链接或 11 位 ID；返回立即）。"""
+    from gateway import yt_subs
+
+    vid = yt_subs.video_id_from(v)
+    if not vid:
+        raise HTTPException(status_code=400, detail="invalid_video")
+
+    cur = yt_subs.PROGRESS.get(vid)
+    if cur and cur.get("state") in ("queued", "fetching", "working"):
+        return {"status": "already", "video_id": vid}
+
+    yt_subs.PROGRESS[vid] = {"state": "queued", "total": 0, "done": 0, "t0": time.time()}
+
+    async def _run():
+        await yt_subs.translate_track(vid, src, tgt)
+
+    if background_tasks is not None:
+        background_tasks.add_task(_run)
+    else:
+        asyncio.create_task(_run())
+    return {"status": "ok", "video_id": vid, "src": src, "tgt": tgt}
+
 
 # ----------------- 实时滚动日志 API -----------------
 

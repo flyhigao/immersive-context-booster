@@ -66,6 +66,39 @@
 
 ---
 
+## 可选：手机 / YouTube App 内 AI 字幕
+
+手机端客户端（如 Morphe 补丁 `AI caption translator`、PolyglotYT 等）会在自己的 System Prompt 里写死 **JSON Schema 输出协议**，任何额外注入都会破坏其解析。所以网关提供了一个**无注入直通入口**：
+
+- `POST http://127.0.0.1:8787/v1/plain/chat/completions`
+- 或者任意请求体里带 `response_format` 时自动进入该模式
+
+该模式下：不注入语境 / 术语 / 人名规则，不读写翻译缓存，只做模型名改写与转发。
+
+### 手机连 USB 时打通网关
+
+```bash
+# 电脑照常 ./run.sh（网关绑定 127.0.0.1，不需要改）
+adb devices
+adb reverse tcp:8787 tcp:8787   # 手机的 127.0.0.1:8787 → 电脑的 127.0.0.1:8787
+adb reverse --list              # 重新插拔 USB 后需要重跑
+```
+
+### YouTube App 内接法（Morphe + AI caption translator）
+
+1. 安装 [Morphe Manager](https://github.com/MorpheApp/morphe-manager/releases/latest)，设置里开启「专家模式」；
+2. 补丁源 → 添加远程：`https://github.com/YYDarlinker/morphe-ai-caption-translator`；
+3. 用**原版 YouTube APK**（项目声明目标：21.30.216 / 21.42.241 / 21.43.523，后两个为实验性）打补丁，保留官方默认补丁组合；
+4. YouTube → 设置 → Morphe → 视频 → AI字幕翻译：
+   - API 地址：`http://127.0.0.1:8787/v1/plain/chat/completions`
+   - 密钥：随意填（网关不校验入站 key）
+   - 模型：`hy7b`（网关会用 `DEFAULT_MODEL` 覆盖该字段）
+5. 播放视频 → CC → 字幕菜单选「自动翻译 → 中文」。
+
+> 说明：YouTube 自带 `network_security_config` 的 `base-config` 已是 `cleartextTrafficPermitted=true`（仅对 youtube.com / googleapis.com 关闭），因此 `http://127.0.0.1:8787` 可直接访问，无需额外改包。
+
+---
+
 ## 功能特性
 
 1. **预置 80+ 条 NBA/篮球专业术语与论坛黑话**：
