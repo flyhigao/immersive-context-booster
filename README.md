@@ -126,6 +126,7 @@ adb reverse --list              # 重新插拔 USB 后需要重跑
 |---|---|
 | [`docs/subtitle-pipeline.md`](docs/subtitle-pipeline.md) | **Android 字幕链路四种实现的实测数据、优劣对比、当前运行哪一种、如何切换与回滚** |
 | `immersive-context-booster`（本仓库） | 网关本体：注入/术语/缓存（桌面版）+ 协议适配层（手机字幕） |
+| [androidyoutube_translate](https://github.com/flyhigao/androidyoutube_translate) | 部署手册、客户端配置路径与 Cookie 生命周期、踩坑记录 |
 
 ## Android 字幕：协议适配层（当前推荐，2026-11）
 
