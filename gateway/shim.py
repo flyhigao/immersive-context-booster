@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -91,6 +92,24 @@ def parse_numbered(raw: str, n: int) -> Dict[int, str]:
     return out
 
 
+_ASK_SLOTS: "asyncio.Semaphore | None" = None
+
+
+def _ask_slots() -> asyncio.Semaphore:
+    """Bound upstream requests across all chunks/blocks of the plain path.
+
+    The normal /v1/chat/completions path uses MAX_CONCURRENCY, but the shim path
+    used to fan out with asyncio.gather without any global limit.  A single-slot
+    llama.cpp upstream then queues behind many concurrent HTTP requests.
+    """
+    global _ASK_SLOTS
+    if _ASK_SLOTS is None:
+        _ASK_SLOTS = asyncio.Semaphore(
+            max(1, int(os.getenv("SHIM_MAX_CONCURRENCY", "6")))
+        )
+    return _ASK_SLOTS
+
+
 async def _ask(client: httpx.AsyncClient, lines: List[str], tgt: str) -> List[str]:
     payload = {
         "model": settings.DEFAULT_MODEL,
@@ -102,14 +121,16 @@ async def _ask(client: httpx.AsyncClient, lines: List[str], tgt: str) -> List[st
             {"role": "user", "content": _numbered(lines)},
         ],
     }
-    resp = await client.post(
-        f"{settings.UPSTREAM_BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {settings.UPSTREAM_API_KEY}"},
-        json=payload,
-        timeout=120.0,
-    )
-    resp.raise_for_status()
-    raw = resp.json()["choices"][0]["message"]["content"]
+    async with _ask_slots():
+        resp = await client.post(
+            f"{settings.UPSTREAM_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {settings.UPSTREAM_API_KEY}"},
+            json=payload,
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    raw = data["choices"][0]["message"]["content"]
     got = parse_numbered(raw, len(lines))
     return [got.get(i, "") for i in range(len(lines))]
 
